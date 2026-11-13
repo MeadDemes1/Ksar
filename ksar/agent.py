@@ -47,9 +47,7 @@ RULES
 - If something is unclear or several files could match, ask the user instead of guessing."""
 
 class _SayFieldStreamer:
-    """Incrementally decode the JSON string value of the top-level 'say' field."""
-    _marker = re.compile(r'"say"\\s*:\\s*"')
-
+    """Incrementally decode only the top-level JSON string value of the 'say' field."""
     def __init__(self, emit):
         self.emit = emit
         self.raw = ""
@@ -61,15 +59,38 @@ class _SayFieldStreamer:
         self.unicode_digits = ""
         self.pending_high_surrogate = None
 
+    def _find_say_value(self):
+        depth, in_string, escaped, string_start = 0, False, False, -1
+        for i, ch in enumerate(self.raw):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                    if depth == 1 and self.raw[string_start:i + 1] == '"say"':
+                        match = re.match(r'\s*:\s*"', self.raw[i + 1:])
+                        if match:
+                            return i + 1 + match.end()
+            else:
+                if ch == '"':
+                    in_string, string_start = True, i
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+        return None
+
     def feed(self, chunk: str):
         if self.finished or not chunk:
             return
         self.raw += chunk
         if not self.started:
-            match = self._marker.search(self.raw)
-            if not match:
+            start = self._find_say_value()
+            if start is None:
                 return
-            self.pos = match.end()
+            self.pos = start
             self.started = True
 
         out = []
@@ -86,6 +107,8 @@ class _SayFieldStreamer:
                     codepoint = int(self.unicode_digits, 16)
                     self.unicode_digits = ""
                     if 0xD800 <= codepoint <= 0xDBFF:
+                        if self.pending_high_surrogate is not None:
+                            out.append("\ufffd")
                         self.pending_high_surrogate = codepoint
                     elif 0xDC00 <= codepoint <= 0xDFFF and self.pending_high_surrogate is not None:
                         out.append(chr(0x10000 + ((self.pending_high_surrogate - 0xD800) << 10)
@@ -93,7 +116,7 @@ class _SayFieldStreamer:
                         self.pending_high_surrogate = None
                     else:
                         if self.pending_high_surrogate is not None:
-                            out.append("\\ufffd")
+                            out.append("\ufffd")
                             self.pending_high_surrogate = None
                         out.append(chr(codepoint))
                 continue
@@ -104,17 +127,17 @@ class _SayFieldStreamer:
                     self.unicode_left = 4
                     self.unicode_digits = ""
                 else:
-                    out.append({"\\": "\\\\", '"': '"', "/": "/", "b": "\\b",
-                                "f": "\\f", "n": "\\n", "r": "\\r", "t": "\\t"}.get(ch, ch))
+                    out.append({"\\": "\\", '"': '"', "/": "/", "b": "\b",
+                                "f": "\f", "n": "\n", "r": "\r", "t": "\t"}.get(ch, ch))
                 continue
-            if ch == "\\\\":
+            if ch == "\\":
                 self.escaped = True
                 self.pos += 1
             elif ch == '"':
                 self.finished = True
                 self.pos += 1
                 if self.pending_high_surrogate is not None:
-                    out.append("\\ufffd")
+                    out.append("\ufffd")
                     self.pending_high_surrogate = None
                 break
             else:
@@ -122,7 +145,6 @@ class _SayFieldStreamer:
                 self.pos += 1
         if out:
             self.emit("".join(out))
-
 
 def render_result(name: str, res: ToolResult) -> str:
     head = f"TOOL RESULT {name}: {'OK' if res.ok else 'FAILED'} - {res.message}"
