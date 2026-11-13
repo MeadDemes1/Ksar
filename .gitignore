@@ -1,0 +1,8 @@
+# Your private data: conversations, memory, tasks, audit log (contains your Windows paths/username), settings
+/ksar_data/
+/memory/
+*.log
+__pycache__/
+*.pyc
+.venv/
+.obsidian/
