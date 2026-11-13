@@ -78,7 +78,7 @@ class LLMWrapperTests(unittest.TestCase):
     def test_say_streamer_handles_json_escapes_and_chunk_boundaries(self):
         seen = []
         parser = _SayFieldStreamer(seen.append)
-        for chunk in [r'{"say": "Hello\\', r'nworld \\"quoted\\" ', r'and \\u263a"}']:
+        for chunk in ['{"say": "Hello\\', 'nworld \\"quoted\\" ', 'and \\u263a"}']:
             parser.feed(chunk)
         self.assertEqual("".join(seen), 'Hello\nworld "quoted" and ☺')
 
