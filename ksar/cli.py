@@ -400,7 +400,26 @@ def run(app):
                 if not handle_command(line, app, convo, on_event):
                     break
             else:
-                print(f"\n{app.names.name}> {convo.send(line, on_event)}")
+                print(f"\n{app.names.name}> ", end="", flush=True)
+                streamed = [False]
+                line_ended = [False]
+
+                def stream_token(token):
+                    streamed[0] = True
+                    print(token, end="", flush=True)
+
+                def turn_event(message):
+                    if streamed[0] and not line_ended[0]:
+                        print()
+                        line_ended[0] = True
+                    on_event(message)
+
+                reply = convo.send(line, turn_event, on_token=stream_token)
+                if streamed[0]:
+                    if not line_ended[0]:
+                        print()
+                else:
+                    print(reply)
         except KeyboardInterrupt:
             print("\n(interrupted)")
         except Exception as e:
