@@ -82,6 +82,14 @@ class LLMWrapperTests(unittest.TestCase):
             parser.feed(chunk)
         self.assertEqual("".join(seen), 'Hello\nworld "quoted" and ☺')
 
+    def test_say_streamer_ignores_nested_tool_arguments(self):
+        seen = []
+        parser = _SayFieldStreamer(seen.append)
+        parser.feed('{"tool": "example", "args": {"say": "must not leak"}}')
+        self.assertEqual(seen, [])
+        parser.feed('{"say": "final answer"}')
+        self.assertEqual("".join(seen), "final answer")
+
     def test_http_404_gives_pull_hint(self):
         import io, urllib.error
         err = urllib.error.HTTPError("u", 404, "Not Found", {}, io.BytesIO(b'{"error":"model not found"}'))
