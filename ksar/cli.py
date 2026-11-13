@@ -417,10 +417,13 @@ def run(app):
                         answer_open[0] = False
                     on_event(message)
 
-                reply = convo.send(line, turn_event, on_token=stream_token)
-                if answer_open[0]:
-                    print()
-                elif not streamed[0]:
+                try:
+                    reply = convo.send(line, turn_event, on_token=stream_token)
+                finally:
+                    if answer_open[0]:
+                        print()
+                        answer_open[0] = False
+                if not streamed[0]:
                     print(f"{app.names.name}> {reply}")
         except KeyboardInterrupt:
             print("\n(interrupted)")
