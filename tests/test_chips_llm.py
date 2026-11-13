@@ -15,6 +15,7 @@ from ksar.app import Ksar
 from ksar.chips import ChipState
 from ksar.config import Settings
 from ksar.llm import LLM, LLMError, extract_json, strip_think
+from ksar.agent import _SayFieldStreamer
 from ksar.resources import ResourceManager, SystemResources, estimate_model_ram_mb
 
 
@@ -55,6 +56,31 @@ class LLMWrapperTests(unittest.TestCase):
         self.assertEqual(extract_json('{"a": 1} then {"b": 2}'), {"a": 1})
         self.assertEqual(extract_json("```json\n{\"say\": \"x\"}\n```"), {"say": "x"})
         self.assertIsNone(extract_json("no json here"))
+
+    def test_chat_streams_ollama_ndjson_chunks(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def __iter__(self):
+                yield b'{"message":{"content":"hel"},"done":false}\n'
+                yield b'{"message":{"content":"lo"},"done":false}\n'
+                yield b'{"message":{"content":""},"done":true}\n'
+
+        llm = LLM(Settings())
+        seen = []
+        with mock.patch("urllib.request.urlopen", return_value=Response()) as open_url:
+            result = llm.chat([{"role": "user", "content": "x"}], on_token=seen.append)
+        payload = json.loads(open_url.call_args.args[0].data.decode("utf-8"))
+        self.assertIs(payload["stream"], True)
+        self.assertEqual(seen, ["hel", "lo"])
+        self.assertEqual(result, "hello")
+
+    def test_say_streamer_handles_json_escapes_and_chunk_boundaries(self):
+        seen = []
+        parser = _SayFieldStreamer(seen.append)
+        for chunk in [r'{"say": "Hello\\', r'nworld \\"quoted\\" ', r'and \\u263a"}']:
+            parser.feed(chunk)
+        self.assertEqual("".join(seen), 'Hello\nworld "quoted" and ☺')
 
     def test_http_404_gives_pull_hint(self):
         import io, urllib.error
