@@ -405,11 +405,16 @@ def run(app):
                 line_ended = [False]
 
                 def stream_token(token):
-                    streamed[0] = True
+                    if not streamed[0]:
+                        if not line_ended[0]:
+                            print()
+                            line_ended[0] = True
+                        print(f"{app.names.name}> ", end="", flush=True)
+                        streamed[0] = True
                     print(token, end="", flush=True)
 
                 def turn_event(message):
-                    if streamed[0] and not line_ended[0]:
+                    if not line_ended[0]:
                         print()
                         line_ended[0] = True
                     on_event(message)
