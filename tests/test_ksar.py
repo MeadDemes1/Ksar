@@ -382,10 +382,14 @@ class ChatTests(Base):
         out = []
         self.assertIn("don't know", conv.send("what is my favourite colour?", out.append))
         self.assertTrue(any("[tool] memory.search" in o for o in out))
-        a.llm.replies = [J(say="Dark blue, nice!"),
-                         J(ops=[{"op": "add", "note": "meady", "title": "Meady", "type": "person",
+        a.llm.replies = [J(say="Dark blue, nice!")]
+        conv.send("remember: it's dark blue, like the sea", out.append)
+        # Ordinary turns only append to the journal; model-based consolidation
+        # is deferred until explicitly requested with /reflect or at shutdown.
+        self.assertEqual(len(conv.pending), 1)
+        a.llm.replies = [J(ops=[{"op": "add", "note": "meady", "title": "Meady", "type": "person",
                                  "facts": ["Favourite colour: dark blue"]}])]
-        conv.send("remember: it's dark blue, like the sea", out.append)     # 'remember' triggers an immediate save
+        conv.flush(out.append)
         self.assertEqual(conv.pending, [])
         # new process, new conversation: still known, and traceable to the raw journal
         a2 = Ksar(home=self.tmp / "home", llm=FakeLLM([J(say="ok")]))
