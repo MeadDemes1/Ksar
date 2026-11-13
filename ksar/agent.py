@@ -22,8 +22,9 @@ from .tasks import Task
 from .tools.base import Risk, Session, ToolResult
 
 MEMORY_QUERY_RE = re.compile(
-    r"\b(my|our|remember|memory|recall|previous|earlier|last time|told you|we discussed|"
-    r"what did i say|what have i said|помни|прошл\w*|говорил\w*|обсуждал\w*)\b", re.I)
+    r"\b(remember|memory|recall|previous|earlier|last time|told you|we discussed|do you remember|"
+    r"what did i say|what have i said|what is my|what's my|what was my|what were my|"
+    r"помни|прошл\w*|говорил\w*|обсуждал\w*)\b", re.I)
 
 COMPLEX_RE = re.compile(
     r"\b(plan|planning|analy[sz]e|analysis|debug|architecture|refactor|design|compare|investigate|step[- ]by[- ]step"
