@@ -119,9 +119,52 @@ class LLM:
         except OSError as e:
             raise LLMError(f"Connection to Ollama failed: {e}") from e
 
+    # ------------------------------------------------------------------ streaming transport
+    def _stream_chat(self, payload: dict, on_token) -> dict:
+        """Read Ollama's newline-delimited chat stream and forward content chunks."""
+        url = f"{self.base_url}/api/chat"
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        pieces = []
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                for line in response:
+                    if not line.strip():
+                        continue
+                    try:
+                        item = json.loads(line.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                        raise LLMError(f"Ollama returned an invalid streaming chunk: {e}") from e
+                    if item.get("error"):
+                        raise LLMError(str(item["error"]))
+                    content = (item.get("message") or {}).get("content") or ""
+                    if content:
+                        pieces.append(content)
+                        on_token(content)
+                    if item.get("done"):
+                        break
+            return {"message": {"content": "".join(pieces)}}
+        except urllib.error.HTTPError as e:
+            try:
+                detail = json.loads(e.read().decode("utf-8")).get("error", "")
+            except Exception:
+                detail = ""
+            model = payload.get("model", "?")
+            if e.code == 404:
+                raise LLMError(f"Model '{model}' is not installed in Ollama. Run: ollama pull {model}") from e
+            raise LLMError(f"Ollama error {e.code}: {detail or e.reason}") from e
+        except urllib.error.URLError as e:
+            raise LLMError(f"Cannot reach Ollama at {self.base_url}. Is it running? ({e.reason})") from e
+        except TimeoutError as e:
+            raise LLMError(f"Ollama did not answer within {self.timeout}s "
+                           "(model too slow or still loading; raise request_timeout)") from e
+        except OSError as e:
+            raise LLMError(f"Connection to Ollama failed: {e}") from e
+
     # ------------------------------------------------------------------ chat
     def chat(self, messages: list, model: str = None, keep_alive=None,
-             json_mode: bool = False, temperature: float = None) -> str:
+             json_mode: bool = False, temperature: float = None, on_token=None) -> str:
         """
         keep_alive: -1 = stay loaded, 0 = unload right after, "30m" = unload after idle, None = Ollama default.
         json_mode:  forces valid JSON output.
@@ -129,14 +172,15 @@ class LLM:
         options = {"temperature": self.temperature if temperature is None else temperature}
         if self.num_ctx:
             options["num_ctx"] = self.num_ctx           # without this Ollama silently uses its small default
-        payload = {"model": model or self.model, "messages": messages, "stream": False, "options": options}
+        payload = {"model": model or self.model, "messages": messages,
+                   "stream": on_token is not None, "options": options}
         if not self.think:
-            payload["think"] = False                    # Qwen3: skip the slow hidden reasoning (big CPU saving)
+            payload["think"] = False                    # Qwen3: skip hidden reasoning unless explicitly enabled
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
         if json_mode:
             payload["format"] = "json"
-        data = self._request("/api/chat", payload)
+        data = self._stream_chat(payload, on_token) if on_token is not None else self._request("/api/chat", payload)
         if data.get("error"):
             raise LLMError(str(data["error"]))
         return strip_think(data.get("message", {}).get("content", "") or "")
