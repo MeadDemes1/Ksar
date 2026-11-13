@@ -21,7 +21,10 @@ from .memory.store import today
 from .tasks import Task
 from .tools.base import Risk, Session, ToolResult
 
-REMEMBER_RE = re.compile(r"remember|запомни|не забудь", re.I)
+MEMORY_QUERY_RE = re.compile(
+    r"\\b(my|our|remember|memory|recall|previous|earlier|last time|told you|we discussed|"
+    r"what did i say|what have i said|помни|прошл\\w*|говорил\\w*|обсуждал\\w*)\\b", re.I)
+
 COMPLEX_RE = re.compile(
     r"\b(plan|planning|analy[sz]e|analysis|debug|architecture|refactor|design|compare|investigate|step[- ]by[- ]step"
     r"|план\w*|анализ\w*|проанализ\w*|отлад\w*|архитектур\w*|сравни\w*)\b", re.I)
@@ -163,11 +166,14 @@ class Agent:
                "locally. Be warm, concise and honest. Answer in the user's language.\n")
         mode = ("You are working on a TASK on your own. Work step by step with tools. When finished reply "
                 '{"finish": "short summary of what was done"}.\n') if task else ""
-        return (who + f"Current time: {datetime.now():%Y-%m-%d %H:%M}.\n" + mode + PROTOCOL +
-                "\n\nTOOLS:\n" + a.tools.catalog() +
-                "\n\nMEMORY MAP:\n" + a.memory.map_text() +
-                "\n\nRELEVANT MEMORY (facts carry #ids; '(unverified)' = inferred, not confirmed):\n" +
-                a.index.context(query, budget=a.settings.recall_chars))
+        prompt = (who + f"Current time: {datetime.now():%Y-%m-%d %H:%M}.\n" + mode + PROTOCOL +
+                  "\n\nTOOLS:\n" + a.tools.catalog())
+        # Do not serialize the entire memory map or run retrieval for every turn.
+        # Search/index context is added only when the user's wording signals a recall request.
+        if MEMORY_QUERY_RE.search(query or ""):
+            prompt += ("\n\nRELEVANT MEMORY (facts carry #ids; '(unverified)' = inferred, not confirmed):\n" +
+                       a.index.context(query, budget=a.settings.recall_chars))
+        return prompt
 
     def _ask(self, msgs: list, chip, on_token=None) -> str:
         chat = self.app.llm.chat
@@ -208,7 +214,6 @@ class Agent:
         chip = a.chips.get_chip_for_task(classify_complexity(user_text))   # once per turn: no model ping-pong
         streamer = _SayFieldStreamer(on_token) if on_token is not None else None
         try:
-            on_event(f"  [model] {chip.model_id}: generating response...")
             for _ in range(a.settings.max_agent_steps):
                 obj = self._step(msgs, chip, on_token=streamer.feed if streamer is not None else None)
                 if "tool" in obj:
@@ -322,8 +327,9 @@ class Conversation:
         src = a.memory.journal_append(a.names.user, a.names.name, text, reply)
         a.session.src = src
         self.pending.append((text, reply))
-        if REMEMBER_RE.search(text) or len(self.pending) >= a.settings.consolidate_every:
-            self.flush(on_event)
+        # Keep the raw journal current, but never run LLM-based consolidation in
+        # the interactive response path. Use /reflect when you want to consolidate;
+        # pending exchanges are also consolidated on clean shutdown.
         return reply
 
     def flush(self, on_event: Callable = print) -> bool:
