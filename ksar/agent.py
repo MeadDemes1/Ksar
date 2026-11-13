@@ -174,8 +174,13 @@ class Agent:
         kwargs = {"model": chip.model_id, "json_mode": True,
                   "keep_alive": self.app.chips.keep_alive_for(chip)}
         # Keep compatibility with lightweight test doubles and third-party LLM adapters.
-        if on_token is not None and "on_token" in inspect.signature(chat).parameters:
-            kwargs["on_token"] = on_token
+        if on_token is not None:
+            try:
+                supports_streaming = "on_token" in inspect.signature(chat).parameters
+            except (TypeError, ValueError):
+                supports_streaming = False
+            if supports_streaming:
+                kwargs["on_token"] = on_token
         return chat(msgs, **kwargs)
 
     def _step(self, msgs: list, chip, on_token=None) -> dict:
