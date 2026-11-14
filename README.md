@@ -1,4 +1,4 @@
-# Ksar 0.2.1
+# Ksar 0.3.0
 
 Local assistant with persistent branching memory, controlled tools, resumable tasks, and **dynamic multi-model orchestration**. Python 3.10+, no pip packages.
 
@@ -57,3 +57,10 @@ safety    /perms  /allow read|write <folder>  /revoke read|write <folder>  /audi
 config    /config show | get <key> | set <key> <value>
 chips     /chip [status] | active | load <chip> | unload <chip>
           /chippref [speed|balanced|quality]
+
+## Talking to Ksar (0.3)
+- Just chat: answers stream live straight from the model, no tools or memory in the way.
+- Memory is read only when your message asks for it ("what do you know about...", "remember...", "yesterday...").
+- Tools work for their name: write `fs.read_text`, `@fs` or `@memory` in a message, or ask about files/folders.
+  Or run one yourself without the model: `/tools`, `/fs.list`, `/fs.read_text notes.txt`.
+- `/think on|off` for reasoning (thoughts show live in grey). `/save` writes memory now.

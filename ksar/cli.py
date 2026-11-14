@@ -5,6 +5,9 @@ The console and any future GUI must use the same settings backend (config.py / s
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import sys
 from dataclasses import asdict, is_dataclass
 
 from .agent import Agent, Conversation
@@ -20,11 +23,15 @@ CONFIG_KEYS = {
     "chips.standard": ("standard_chip", "str", None),
     "chips.advanced": ("advanced_chip", "str", None),
     "llm.think": ("think", "bool", None),
+    "llm.show_thinking": ("show_thinking", "bool", None),
     "llm.num_ctx": ("num_ctx", "int", None),
 }
 
 HELP = """
-chat      just type; risky actions ask you [y/N]
+chat      just type; risky actions ask you [y/N]. Ksar only uses memory/tools when your message needs them.
+think     /think [on|off]       let Ksar reason first (smarter, slower); thoughts show live in grey
+tools     /tools                 list tools    /<tool> [args]   run one yourself, e.g. /fs.list  /fs.read_text notes.txt
+          name a tool (fs.read_text) or write @fs / @memory in a message to give Ksar that tool
 memory    /tree  /recall <q>  /open <note>  /history <note>  /restore <note> <version>
           /forget-note <note>  /purge <note>  /doctor [fix]  /reflect
 tasks     /task <objective>  /tasks  /resume <id>  /cancel <id>  /report <id>
@@ -32,7 +39,7 @@ safety    /perms  /allow read|write <folder>  /revoke read|write <folder>  /audi
 config    /config show | get <key> | set <key> <value>
 chips     /chip [status] | active | load <chip> | unload <chip>      (also /chips)
           /chippref [speed|balanced|quality]    how eagerly the advanced chip is used
-other     /help  /exit
+other     /save (memory update now)  /help  /exit
 """
 
 
@@ -284,6 +291,115 @@ def cmd_config(app, args):
     print("Usage: /config show | get <key> | set <key> <value>")
 
 
+
+# ----------------------------------------------------------------- live output
+class Live:
+    """Prints the model's thoughts (grey) and answer as they are produced, plus a speed line at the end."""
+
+    def __init__(self, name: str, show_thinking: bool = True):
+        self.name, self.show_thinking = name, show_thinking
+        self.color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+        if self.color and os.name == "nt":
+            os.system("")                              # switches on ANSI colours in the Windows console
+        self.in_think = self.started = False
+        self.chars = 0
+        self.stats = {}
+        self._first_content = True
+        self._thought_chars = 0
+
+    def _dim(self, on: bool) -> str:
+        return ("\x1b[2m" if on else "\x1b[0m") if self.color else ""
+
+    def begin(self) -> None:
+        print(f"\n{self.name}> ", end="", flush=True)
+        self.started = True
+
+    def __call__(self, kind: str, text: str) -> None:
+        if kind == "thinking":
+            self._thought_chars += len(text)
+            if not self.show_thinking:
+                return
+            if not self.in_think:
+                print(f"\n{self._dim(True)}[thinking] ", end="")
+                self.in_think = True
+            print(text, end="", flush=True)
+        elif kind == "content":
+            if self.in_think:
+                print(f"{self._dim(False)}\n", flush=True)
+                self.in_think = False
+                self._first_content = True
+                print(f"{self.name}> ", end="", flush=True)
+            if self._first_content:
+                text = text.lstrip("\n ")
+                self._first_content = False
+            self.chars += len(text)
+            print(text, end="", flush=True)
+        elif kind == "stats":
+            self.stats = text
+
+    def finish(self, reply: str) -> None:
+        if self.in_think:
+            print(self._dim(False), end="")
+        if not self.chars:                              # nothing was streamed (e.g. a tool answer): print it now
+            if not self.started:
+                self.begin()
+            print(reply, end="")
+        n, ns = self.stats.get("eval_count"), self.stats.get("eval_duration")
+        if n and ns:
+            print(f"\n{self._dim(True)}  ({n} tokens, {n / (ns / 1e9):.1f} tok/s){self._dim(False)}")
+        else:
+            print()
+
+
+def _parse_tool_args(tool, rest: list) -> dict:
+    """/fs.list  |  /fs.read_text notes.txt  |  /fs.write_text path=a.txt content="hi"  |  /tool {"path": "a"}"""
+    raw = " ".join(rest).strip()
+    if not raw:
+        return {}
+    if raw.startswith("{"):
+        return json.loads(raw)
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        tokens = rest
+    if all("=" in t for t in tokens):
+        return dict(t.split("=", 1) for t in tokens)
+    first = next(iter(tool.params), None)
+    return {first: raw} if first else {}
+
+
+def cmd_tool(app, name: str, rest: list) -> None:
+    tool = app.tools.tools.get(name)
+    if not tool:
+        print(f"unknown tool '{name}'. /tools lists them.")
+        return
+    try:
+        args = _parse_tool_args(tool, rest)
+    except json.JSONDecodeError as e:
+        print(f"arguments are not valid JSON: {e}")
+        return
+    res = app.tools.call(name, args)
+    print(f"{'ok' if res.ok else 'FAILED'}: {res.message}")
+    if res.data:
+        print(res.data[:4000] + ("\n... (cut)" if len(res.data) > 4000 else ""))
+
+
+def cmd_tools(app) -> None:
+    print(app.tools.catalog())
+
+
+def cmd_think(app, args) -> None:
+    if args:
+        if args[0].lower() not in ("on", "off"):
+            print("Usage: /think on|off")
+            return
+        app.settings.think = args[0].lower() == "on"
+        app.llm.think = app.settings.think
+        _save_settings(app)
+    s = app.settings
+    print(f"thinking is {'ON (smarter, slower)' if s.think else 'OFF (fast)'}; "
+          f"showing thoughts: {'yes' if s.show_thinking else 'no'}  (/config set llm.show_thinking true|false)")
+
 # ----------------------------------------------------------------- chips
 def cmd_chips(app, args):
     cm = _chip_manager(app)
@@ -349,6 +465,19 @@ def handle_command(raw: str, app, convo, on_event) -> bool:
         cmd_chips(app, args)
     elif cmd == "chippref":
         cmd_chippref(app, args)
+    elif cmd == "think":
+        cmd_think(app, args)
+    elif cmd == "tools":
+        cmd_tools(app)
+    elif cmd == "tool":
+        if not args:
+            print("Usage: /tool <name> [args]   (/tools lists the names)")
+        else:
+            cmd_tool(app, args[0], args[1:])
+    elif cmd in app.tools.tools:              # /fs.list  /fs.read_text notes.txt
+        cmd_tool(app, cmd, args)
+    elif cmd == "save":
+        convo.flush(on_event)
     elif cmd in GROUPS:                       # grouped form: /memory tree
         handler = GROUPS[cmd]
         if handler is cmd_memory:
@@ -400,31 +529,10 @@ def run(app):
                 if not handle_command(line, app, convo, on_event):
                     break
             else:
-                print()
-                streamed = [False]
-                answer_open = [False]
-
-                def stream_token(token):
-                    if not answer_open[0]:
-                        print(f"{app.names.name}> ", end="", flush=True)
-                        answer_open[0] = True
-                        streamed[0] = True
-                    print(token, end="", flush=True)
-
-                def turn_event(message):
-                    if answer_open[0]:
-                        print()
-                        answer_open[0] = False
-                    on_event(message)
-
-                try:
-                    reply = convo.send(line, turn_event, on_token=stream_token)
-                finally:
-                    if answer_open[0]:
-                        print()
-                        answer_open[0] = False
-                if not streamed[0]:
-                    print(f"{app.names.name}> {reply}")
+                live = Live(app.names.name, app.settings.show_thinking)
+                live.begin()
+                reply = convo.send(line, on_event, live)
+                live.finish(reply)
         except KeyboardInterrupt:
             print("\n(interrupted)")
         except Exception as e:

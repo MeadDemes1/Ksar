@@ -144,10 +144,10 @@ class Index:
             matching += newest[:min(3, cap - len(matching))]
         return matching
 
-    def context(self, query: str, budget: int = 4500, limit: int = 4) -> str:
+    def context(self, query: str, budget: int = 4500, limit: int = 4, include_core: bool = True) -> str:
         """Text block for the prompt: core + the most relevant notes/facts, within a budget."""
         parts, used = [], 0
-        core = self.store.get("core", copy_=False)
+        core = self.store.get("core", copy_=False) if include_core else None
         if core:
             lines = [f"[core] {core.summary}"] + [f"  - {f.text}" for f in core.facts[:12]]
             block = "\n".join(lines)[:1500]
@@ -170,7 +170,7 @@ class Index:
                 break
             parts.append(block)
             used += len(block)
-        return "\n\n".join(parts) or "(no notes yet)"
+        return "\n\n".join(parts) or ("(no notes yet)" if include_core else "")
 
     def explain(self, query: str) -> str:
         hits = self.search(query, limit=8)

@@ -1,7 +1,7 @@
 """Housekeeping that keeps memory navigable. The LLM only GROUPS facts; the app moves them verbatim."""
 from __future__ import annotations
 
-from ..llm import extract_json
+from ..llm import extract_json, no_think
 from .store import MemoryStore, safe_id
 
 
@@ -19,7 +19,7 @@ def split_note(store: MemoryStore, llm, nid: str, threshold: int = 25):
         '{"groups":[{"id":"short-hyphenated-id","title":"..","summary":"one line","facts":[1,2,3]}]}\n\n'
         + numbered)
     try:
-        data = extract_json(llm.chat([{"role": "user", "content": prompt}], json_mode=True, temperature=0.2))
+        data = extract_json(llm.chat([{"role": "user", "content": prompt}], json_mode=True, temperature=0.2, **no_think(llm)))
     except Exception:
         return None
     groups = data.get("groups") if isinstance(data, dict) else None

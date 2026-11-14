@@ -17,13 +17,14 @@ class Settings:
     model: str = "qwen3:8b"           # legacy; standard_chip is the real setting
     ollama_url: str = "http://localhost:11434"
     num_ctx: int = 8192
-    think: bool = False               # Qwen3 hidden reasoning: off = much faster on CPU
+    think: bool = False               # Qwen3 reasoning: on = smarter but slower; /think on|off
+    show_thinking: bool = True        # show the thoughts live (dim) when think is on
     temperature: float = 0.3
     request_timeout: int = 900
     max_agent_steps: int = 6          # tool calls allowed per user message
     recent_messages: int = 12         # chat history sent to the model
-    recall_chars: int = 4500          # memory text injected per reply
-    consolidate_every: int = 3        # exchanges between memory updates
+    recall_chars: int = 2000          # memory text injected, only when a message needs memory
+    consolidate_every: int = 8        # exchanges between memory updates (also on /exit and "remember")
     split_fact_threshold: int = 25    # a note with more facts gets branched
     max_fact_chars: int = 300
 

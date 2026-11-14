@@ -380,16 +380,12 @@ class ChatTests(Base):
         ])
         conv = a.conversation()
         out = []
-        self.assertIn("don't know", conv.send("what is my favourite colour?", out.append))
+        self.assertIn("don't know", conv.send("search your memory for my favourite colour", out.append))
         self.assertTrue(any("[tool] memory.search" in o for o in out))
-        a.llm.replies = [J(say="Dark blue, nice!")]
-        conv.send("remember: it's dark blue, like the sea", out.append)
-        # Ordinary turns only append to the journal; model-based consolidation
-        # is deferred until explicitly requested with /reflect or at shutdown.
-        self.assertEqual(len(conv.pending), 1)
-        a.llm.replies = [J(ops=[{"op": "add", "note": "meady", "title": "Meady", "type": "person",
+        a.llm.replies = [J(say="Dark blue, nice!"),
+                         J(ops=[{"op": "add", "note": "meady", "title": "Meady", "type": "person",
                                  "facts": ["Favourite colour: dark blue"]}])]
-        conv.flush(out.append)
+        conv.send("remember: it's dark blue, like the sea", out.append)     # 'remember' triggers an immediate save
         self.assertEqual(conv.pending, [])
         # new process, new conversation: still known, and traceable to the raw journal
         a2 = Ksar(home=self.tmp / "home", llm=FakeLLM([J(say="ok")]))
@@ -400,9 +396,13 @@ class ChatTests(Base):
         day, turn = fact.src[5:].split("#")
         self.assertIn("dark blue, like the sea", (a2.paths.memory / "journal" / f"{day}.md").read_text(encoding="utf-8"))
 
-    def test_malformed_model_output_is_handled(self):
-        a = self.app(["this is not json", "still not json"])
-        self.assertEqual(a.conversation().send("hi"), "still not json")
+    def test_plain_chat_returns_the_model_text_as_is(self):
+        a = self.app(["this is not json"])
+        self.assertEqual(a.conversation().send("hi"), "this is not json")
+
+    def test_malformed_model_output_in_tool_mode_is_handled(self):
+        a = self.app(["{broken", "still not json"])
+        self.assertEqual(a.conversation().send("what files are in my workspace?"), "still not json")
 
 
 if __name__ == "__main__":

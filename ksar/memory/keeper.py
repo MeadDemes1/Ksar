@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from ..llm import extract_json
+from ..llm import extract_json, no_think
 from .store import CONFIDENCE, NOTE_TYPES, MemoryStore, safe_id, today
 
 INJECTION = re.compile(
@@ -155,7 +155,7 @@ class Keeper:
         prompt = build_prompt(convo, self.index.context(convo, budget=2500), self.store.map_text())
         rep = KeeperReport()
         try:
-            raw = self.llm.chat([{"role": "user", "content": prompt}], json_mode=True, temperature=0.2)
+            raw = self.llm.chat([{"role": "user", "content": prompt}], json_mode=True, temperature=0.2, **no_think(self.llm))
         except Exception as e:
             rep.ok = False
             rep.add(f"memory update failed: {e}", changed=False)

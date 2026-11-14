@@ -196,9 +196,12 @@ class ToolManager:
     def register(self, tool: Tool) -> None:
         self.tools[tool.name] = tool
 
-    def catalog(self) -> str:
+    def catalog(self, names=None) -> str:
+        """Tool list for the prompt; pass names to list only some (a short prompt is a fast prompt)."""
         rows = []
         for t in self.tools.values():
+            if names is not None and t.name not in names:
+                continue
             args = ", ".join(f"{k}:{p.type}{'' if p.required else '?'}" for k, p in t.params.items())
             rows.append(f"- {t.name}({args}) [{t.risk.name.lower()}] {t.description}")
         return "\n".join(rows)
