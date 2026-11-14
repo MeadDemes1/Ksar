@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1 ("3.1") - third chip slot and idle moments
+Full description: `docs/v3.1.md`.
+- New **light** chip slot (`/config set chips.light qwen3:1.7b`), used only in idle moments.
+- New idle worker: warms the standard model at start-up, saves memory on the light chip while you are quiet
+  (additions only, facts must be found in your own words), branches oversized notes, checks memory once a day.
+  Stops the instant you press Enter. `/idle [status|on|off|now]`.
+- Chat history window shrinks in steps, so Ollama's prompt cache is reused for several turns.
+- Memory/note-splitting refactored so a model call never happens while memory is locked.
+- 18 new tests (67 in total).
+
 ## 0.3.0 - speed release: Ksar talks like plain Ollama, uses memory/tools only when needed
 
 ### Why it was 5x slower than Ollama

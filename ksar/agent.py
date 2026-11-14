@@ -344,30 +344,51 @@ class Conversation:
         self.app = app
         self.history: list = []
         self.pending: list = []
+        self.gen = 0                  # counts memory saves; lets background work notice that a save happened
+        self._start = 0               # first history message that is still sent to the model
+
+    def window(self) -> list:
+        """The part of the history sent to the model. It shrinks in STEPS (to half) instead of by one message
+        per turn: a stable start means Ollama can reuse its cached prompt, a sliding start recomputes everything."""
+        s, h = self.app.settings, self.history
+        limit = max(2, int(s.recent_messages))
+
+        def size(start):
+            return sum(len(m["content"]) for m in h[start:])
+
+        if len(h) - self._start > limit or size(self._start) > s.history_chars:
+            keep = max(2, (limit // 2) // 2 * 2)
+            while keep > 2 and sum(len(m["content"]) for m in h[len(h) - keep:]) > s.history_chars // 2:
+                keep -= 2
+            self._start = max(self._start, len(h) - keep)
+        return h[self._start:]
 
     def send(self, text: str, on_event: Callable = print, on_token: Callable = None) -> str:
         a = self.app
-        reply = a.agent.turn(text, self.history, on_event, on_token)
-        self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
-        src = a.memory.journal_append(a.names.user, a.names.name, text, reply)
-        a.session.src = src
-        self.pending.append((text, reply))
-        if REMEMBER_RE.search(text) or len(self.pending) >= a.settings.consolidate_every:
-            self.flush(on_event)
+        with a.lock:
+            reply = a.agent.turn(text, self.window(), on_event, on_token)
+            self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
+            src = a.memory.journal_append(a.names.user, a.names.name, text, reply)
+            a.session.src = src
+            self.pending.append((text, reply))
+            if REMEMBER_RE.search(text) or len(self.pending) >= a.settings.consolidate_every:
+                self.flush(on_event)
         return reply
 
     def flush(self, on_event: Callable = print) -> bool:
         a = self.app
-        if not self.pending:
-            return True
-        on_event("  (updating memory...)")
-        rep = a.keeper.consolidate(self.pending, a.session.src, tainted=a.session.tainted)
-        for line in rep.lines:
-            on_event(f"  memory: {line}")
-        self.pending = [] if rep.ok else self.pending[-12:]
-        for n in a.memory.all_notes():
-            if len(n.facts) > a.settings.split_fact_threshold:
-                made = split_note(a.memory, a.llm, n.id, a.settings.split_fact_threshold)
-                if made:
-                    on_event(f"  memory: note '{n.id}' branched into {', '.join(made)}")
-        return rep.ok
+        with a.lock:
+            if not self.pending:
+                return True
+            on_event("  (updating memory...)")
+            rep = a.keeper.consolidate(self.pending, a.session.src, tainted=a.session.tainted)
+            for line in rep.lines:
+                on_event(f"  memory: {line}")
+            self.pending = [] if rep.ok else self.pending[-12:]
+            self.gen += 1
+            for n in a.memory.all_notes():
+                if len(n.facts) > a.settings.split_fact_threshold:
+                    made = split_note(a.memory, a.llm, n.id, a.settings.split_fact_threshold)
+                    if made:
+                        on_event(f"  memory: note '{n.id}' branched into {', '.join(made)}")
+            return rep.ok

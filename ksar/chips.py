@@ -38,12 +38,13 @@ class Chip:
     last_error: str = ""
 
 
-# retention -> Ollama keep_alive for (standard, advanced)
+# retention -> Ollama keep_alive for (standard, advanced, light)
 KEEP_ALIVE = {
-    "persistent": (-1, -1),
-    "balanced": ("30m", "10m"),
-    "aggressive": ("5m", 0),
+    "persistent": (-1, -1, "30m"),
+    "balanced": ("30m", "10m", "5m"),
+    "aggressive": ("5m", 0, 0),
 }
+_SLOT = {ChipRole.STANDARD: 0, ChipRole.ADVANCED: 1, ChipRole.LIGHTWEIGHT: 2}
 
 
 class ChipManager:
@@ -59,8 +60,11 @@ class ChipManager:
         s = self.app.settings
         old = self.chips
         self.chips = {}
-        for name, role, model in (("standard", ChipRole.STANDARD, getattr(s, "standard_chip", "") or "qwen3:8b"),
-                                  ("advanced", ChipRole.ADVANCED, getattr(s, "advanced_chip", ""))):
+        std = getattr(s, "standard_chip", "") or "qwen3:8b"
+        light = getattr(s, "light_chip", "")
+        for name, role, model in (("standard", ChipRole.STANDARD, std),
+                                  ("advanced", ChipRole.ADVANCED, getattr(s, "advanced_chip", "")),
+                                  ("light", ChipRole.LIGHTWEIGHT, "" if light == std else light)):
             if not model:
                 continue
             prev = old.get(name)
@@ -94,8 +98,7 @@ class ChipManager:
     # ------------------------------------------------------------------ routing
     def keep_alive_for(self, chip: Chip):
         retention = getattr(self.app.settings, "chips_retention", "balanced")
-        pair = KEEP_ALIVE.get(retention, KEEP_ALIVE["balanced"])
-        return pair[0] if chip.role == ChipRole.STANDARD else pair[1]
+        return KEEP_ALIVE.get(retention, KEEP_ALIVE["balanced"])[_SLOT[chip.role]]
 
     def _advanced_allowed(self, complexity: str) -> bool:
         s = self.app.settings
@@ -128,8 +131,30 @@ class ChipManager:
         self.active_chip = std
         return std
 
+    # ------------------------------------------------------------------ light slot (idle moments)
+    def light_for_idle(self):
+        """(chip or None, reason). The light chip is only ever used for background work, never for your chat."""
+        chip = self.chips.get("light")
+        if chip is None:
+            return None, "no light chip configured (/config set chips.light qwen3:1.7b)"
+        if time.time() - chip.failed_at < RETRY_AFTER_FAILURE_S and chip.failed_at:
+            return None, f"light chip failed recently: {chip.last_error}"
+        if chip.state == ChipState.UNLOADED:
+            self.refresh()
+            if chip.state == ChipState.UNLOADED:
+                ok, why = self.resources.explain(chip.estimated_ram_mb)
+                if not ok:
+                    return None, why
+        return chip, "ok"
+
+    def ensure_loaded(self, chip: Chip) -> bool:
+        """Loads a chip if Ollama does not have it yet (quietly: this runs in the background)."""
+        if chip.state != ChipState.UNLOADED:
+            return True
+        return self._load_chip(chip, quiet=True)
+
     # ------------------------------------------------------------------ lifecycle
-    def _load_chip(self, chip: Chip) -> bool:
+    def _load_chip(self, chip: Chip, quiet: bool = False) -> bool:
         try:
             if callable(getattr(self.app.llm, "load", None)):
                 self.app.llm.load(chip.model_id, keep_alive=self.keep_alive_for(chip))
@@ -144,7 +169,8 @@ class ChipManager:
             chip.state = ChipState.UNLOADED
             chip.failed_at = time.time()
             chip.last_error = str(e)
-            print(f"  (chip '{chip.name}' could not be loaded: {e})")
+            if not quiet:
+                print(f"  (chip '{chip.name}' could not be loaded: {e})")
             return False
 
     def load_chip(self, chip_name: str) -> str:

@@ -11,6 +11,7 @@ from pathlib import Path
 class Settings:
     standard_chip: str = "qwen3:8b"
     advanced_chip: str = ""
+    light_chip: str = ""              # small model for idle moments, e.g. qwen3:1.7b ("" = off)
     performance_priority: str = "balanced"  # speed, balanced, quality
     auto_escalation: bool = True
     chips_retention: str = "balanced"  # aggressive, balanced, persistent
@@ -22,7 +23,11 @@ class Settings:
     temperature: float = 0.3
     request_timeout: int = 900
     max_agent_steps: int = 6          # tool calls allowed per user message
-    recent_messages: int = 12         # chat history sent to the model
+    recent_messages: int = 16         # chat history sent to the model (trimmed in steps, see Conversation.window)
+    history_chars: int = 12000        # ...or fewer messages when they are long
+    idle_enabled: bool = True         # background work while you are not talking to Ksar
+    idle_after_s: int = 20            # seconds of quiet before idle work starts
+    warm_on_start: bool = True        # load the standard model in the background at start-up
     recall_chars: int = 2000          # memory text injected, only when a message needs memory
     consolidate_every: int = 8        # exchanges between memory updates (also on /exit and "remember")
     split_fact_threshold: int = 25    # a note with more facts gets branched

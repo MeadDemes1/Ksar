@@ -214,10 +214,12 @@ class LLM:
         except OSError as e:
             raise LLMError(f"Connection to Ollama failed: {e}") from e
 
-    def _chat_payload(self, messages, model, keep_alive, json_mode, temperature, think, stream) -> dict:
+    def _chat_payload(self, messages, model, keep_alive, json_mode, temperature, think, stream, max_tokens=None) -> dict:
         options = {"temperature": self.temperature if temperature is None else temperature}
         if self.num_ctx:
             options["num_ctx"] = self.num_ctx           # without this Ollama silently uses its small default
+        if max_tokens:
+            options["num_predict"] = int(max_tokens)    # hard cap (used for short background jobs)
         payload = {"model": model or self.model, "messages": messages, "stream": stream, "options": options}
         want_think = self.think if think is None else think
         if want_think:
@@ -232,13 +234,13 @@ class LLM:
 
     # ------------------------------------------------------------------ chat
     def chat(self, messages: list, model: str = None, keep_alive=None,
-             json_mode: bool = False, temperature: float = None, think: bool = None) -> str:
+             json_mode: bool = False, temperature: float = None, think: bool = None, max_tokens: int = None) -> str:
         """
         keep_alive: -1 = stay loaded, 0 = unload right after, "30m" = unload after idle, None = Ollama default.
         json_mode:  forces valid JSON output.
         think:      None = use the setting; True/False overrides it for this call.
         """
-        payload = self._chat_payload(messages, model, keep_alive, json_mode, temperature, think, False)
+        payload = self._chat_payload(messages, model, keep_alive, json_mode, temperature, think, False, max_tokens)
         try:
             data = self._request("/api/chat", payload)
         except LLMError as e:
@@ -252,12 +254,12 @@ class LLM:
         return strip_think(data.get("message", {}).get("content", "") or "")
 
     def stream_chat(self, messages: list, model: str = None, keep_alive=None, json_mode: bool = False,
-                    temperature: float = None, think: bool = None):
+                    temperature: float = None, think: bool = None, max_tokens: int = None):
         """
         Generator of (kind, text):  ("thinking", ...) | ("content", ...) | ("stats", {...}) at the end.
         Tokens arrive as the model produces them, so the user sees progress instead of a silent minute.
         """
-        payload = self._chat_payload(messages, model, keep_alive, json_mode, temperature, think, True)
+        payload = self._chat_payload(messages, model, keep_alive, json_mode, temperature, think, True, max_tokens)
         for attempt in (1, 2):
             req = urllib.request.Request(f"{self.base_url}/api/chat", data=json.dumps(payload).encode("utf-8"),
                                          headers={"Content-Type": "application/json"}, method="POST")

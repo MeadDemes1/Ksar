@@ -5,23 +5,42 @@ from ..llm import extract_json, no_think
 from .store import MemoryStore, safe_id
 
 
-def split_note(store: MemoryStore, llm, nid: str, threshold: int = 25):
-    """If a note has too many facts, branch it into sub-notes. No fact text is ever rewritten."""
+def split_prompt(store: MemoryStore, nid: str, threshold: int = 25):
+    """Prompt for grouping a big note's facts, or None if the note needs no split (no model call)."""
     note = store.get(nid)
     if not note or note.type in ("episodic", "core") or len(note.facts) <= threshold:
         return None
     if any(not f.fid for f in note.facts):      # run /doctor first: ids are needed to move facts safely
         return None
     numbered = "\n".join(f"{i + 1}. {f.text}" for i, f in enumerate(note.facts))
-    prompt = (
+    return (
         f"Group these {len(note.facts)} memory facts into 2-4 coherent sub-topics. Facts that fit no "
         "group stay unassigned. Return ONLY JSON:\n"
         '{"groups":[{"id":"short-hyphenated-id","title":"..","summary":"one line","facts":[1,2,3]}]}\n\n'
         + numbered)
+
+
+def split_note(store: MemoryStore, llm, nid: str, threshold: int = 25):
+    """If a note has too many facts, branch it into sub-notes. No fact text is ever rewritten."""
+    prompt = split_prompt(store, nid, threshold)
+    if not prompt:
+        return None
     try:
-        data = extract_json(llm.chat([{"role": "user", "content": prompt}], json_mode=True, temperature=0.2, **no_think(llm)))
+        raw = llm.chat([{"role": "user", "content": prompt}], json_mode=True, temperature=0.2, **no_think(llm))
     except Exception:
         return None
+    return split_apply(store, nid, raw, threshold)
+
+
+def split_apply(store: MemoryStore, nid: str, raw: str, threshold: int = 25, expect: list = None):
+    """expect = the fact ids the prompt was built from; if the note changed meanwhile, nothing is moved
+    (the model's numbers would point at the wrong facts)."""
+    note = store.get(nid)
+    if not note or note.type in ("episodic", "core") or len(note.facts) <= threshold:
+        return None
+    if expect is not None and [f.fid for f in note.facts] != expect:
+        return None
+    data = extract_json(raw)
     groups = data.get("groups") if isinstance(data, dict) else None
     if not isinstance(groups, list):
         return None

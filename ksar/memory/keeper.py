@@ -146,27 +146,80 @@ def apply_ops(store: MemoryStore, ops: list, src: str, tainted: bool = False) ->
     return rep
 
 
+SAFE_IDLE_OPS = ("add", "episode", "link")      # a small model may only ADD things, never correct or replace
+
+
+def _prefixes(text: str) -> set:
+    return {w[:5] for w in re.findall(r"\w{3,}", text.lower())}
+
+
+def grounded(fact: str, user_text: str, need: float = 0.7) -> bool:
+    """True when the VALUE of a proposed fact is actually found in what the user said (5-letter word stems).
+    Stops a small model from inventing facts. 'Favourite colour: dark blue' is checked on 'dark blue'."""
+    value = fact.split(":", 1)[1] if ":" in fact else fact
+    words = [w[:5] for w in re.findall(r"\w{3,}", value.lower())]
+    if not words:
+        return False
+    have = _prefixes(user_text)
+    return sum(1 for w in words if w in have) / len(words) >= need
+
+
+def restrict_ops(ops: list, user_text: str) -> list:
+    """Conservative filter for background (light chip) memory updates."""
+    out = []
+    for op in ops:
+        kind = str(op.get("op", "add")).lower()
+        if kind not in SAFE_IDLE_OPS:
+            continue
+        if kind == "add":
+            facts = op.get("facts") or ([op["fact"]] if op.get("fact") else [])
+            facts = [f for f in (facts if isinstance(facts, list) else [facts]) if grounded(str(f), user_text)]
+            if not facts:
+                continue
+            op = {**op, "facts": facts, "conf": "stated"}
+        elif kind == "episode" and len(str(op.get("text") or "")) > 200:
+            continue
+        out.append(op)
+    return out
+
+
 class Keeper:
     def __init__(self, store: MemoryStore, index, llm):
         self.store, self.index, self.llm = store, index, llm
 
-    def consolidate(self, pending: list, src: str, tainted: bool = False) -> KeeperReport:
+    def prepare(self, pending: list) -> str:
+        """Builds the prompt (reads memory, no model call): call while holding the app lock."""
         convo = "\n".join(f"USER: {u}\nASSISTANT: {a}" for u, a in pending)
-        prompt = build_prompt(convo, self.index.context(convo, budget=2500), self.store.map_text())
+        return build_prompt(convo, self.index.context(convo, budget=2500), self.store.map_text())
+
+    def finish(self, raw: str, src: str, tainted: bool = False, strict_for: list = None) -> KeeperReport:
+        """Validates the model's JSON and applies it. strict_for=pending exchanges -> conservative mode."""
         rep = KeeperReport()
-        try:
-            raw = self.llm.chat([{"role": "user", "content": prompt}], json_mode=True, temperature=0.2, **no_think(self.llm))
-        except Exception as e:
-            rep.ok = False
-            rep.add(f"memory update failed: {e}", changed=False)
-            return rep
         ops = parse_ops(raw)
         self.store._log("keeper reply: " + re.sub(r"\s+", " ", raw)[:500])
         if ops is None:
             rep.ok = False
             rep.add("memory update skipped (unreadable model reply)", changed=False)
             return rep
+        if strict_for is not None:
+            before = len(ops)
+            ops = restrict_ops(ops, " ".join(u for u, _ in strict_for))
+            if before and not ops:
+                rep.add("nothing safe to save", changed=False)
+                return rep
         rep = apply_ops(self.store, ops, src, tainted)
         if not rep.lines:
             rep.add("nothing new worth saving", changed=False)
         return rep
+
+    def consolidate(self, pending: list, src: str, tainted: bool = False) -> KeeperReport:
+        prompt = self.prepare(pending)
+        try:
+            raw = self.llm.chat([{"role": "user", "content": prompt}], json_mode=True, temperature=0.2,
+                                **no_think(self.llm))
+        except Exception as e:
+            rep = KeeperReport()
+            rep.ok = False
+            rep.add(f"memory update failed: {e}", changed=False)
+            return rep
+        return self.finish(raw, src, tainted)

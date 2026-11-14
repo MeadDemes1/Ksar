@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 from .agent import Agent, Conversation
 from .chips import ChipManager
+from .idle import IdleWorker
 from .config import Paths, default_home, load_settings, save_settings
 from .llm import OllamaLLM
 from .memory import Index, MemoryStore
@@ -42,6 +44,8 @@ class Ksar:
         self.resources = ResourceManager(self.paths.workspace)
         self.chips = ChipManager(self, self.resources)       # must exist before the Agent runs
         self.agent = Agent(self)
+        self.lock = threading.RLock()            # held while a command runs and while background jobs touch memory
+        self.idle = IdleWorker(self)             # started by the console; see idle.py
         self.ensure_core()
 
     def save_settings(self) -> None:

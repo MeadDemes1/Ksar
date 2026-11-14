@@ -1,4 +1,4 @@
-# Ksar 0.3.0
+# Ksar 0.3.1
 
 Local assistant with persistent branching memory, controlled tools, resumable tasks, and **dynamic multi-model orchestration**. Python 3.10+, no pip packages.
 
@@ -64,3 +64,7 @@ chips     /chip [status] | active | load <chip> | unload <chip>
 - Tools work for their name: write `fs.read_text`, `@fs` or `@memory` in a message, or ask about files/folders.
   Or run one yourself without the model: `/tools`, `/fs.list`, `/fs.read_text notes.txt`.
 - `/think on|off` for reasoning (thoughts show live in grey). `/save` writes memory now.
+
+## Idle moments (3.1)
+A third, small "light" chip works while you are quiet: warms the main model, saves memory, tidies notes.
+`ollama pull qwen3:1.7b`, then `/config set chips.light qwen3:1.7b`. `/idle` shows what it did. Details: `docs/v3.1.md`.

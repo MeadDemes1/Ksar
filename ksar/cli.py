@@ -22,13 +22,19 @@ CONFIG_KEYS = {
     "chips.auto_escalation": ("auto_escalation", "bool", None),
     "chips.standard": ("standard_chip", "str", None),
     "chips.advanced": ("advanced_chip", "str", None),
+    "chips.light": ("light_chip", "str", None),
+    "idle.enabled": ("idle_enabled", "bool", None),
+    "idle.after": ("idle_after_s", "int", (3, 3600)),
+    "idle.warm": ("warm_on_start", "bool", None),
+    "llm.history_chars": ("history_chars", "int", (1000, 100000)),
     "llm.think": ("think", "bool", None),
     "llm.show_thinking": ("show_thinking", "bool", None),
-    "llm.num_ctx": ("num_ctx", "int", None),
+    "llm.num_ctx": ("num_ctx", "int", (512, 131072)),
 }
 
 HELP = """
 chat      just type; risky actions ask you [y/N]. Ksar only uses memory/tools when your message needs them.
+idle      /idle [status|on|off|now]    background work while you are quiet (see /config set chips.light)
 think     /think [on|off]       let Ksar reason first (smarter, slower); thoughts show live in grey
 tools     /tools                 list tools    /<tool> [args]   run one yourself, e.g. /fs.list  /fs.read_text notes.txt
           name a tool (fs.read_text) or write @fs / @memory in a message to give Ksar that tool
@@ -37,7 +43,7 @@ memory    /tree  /recall <q>  /open <note>  /history <note>  /restore <note> <ve
 tasks     /task <objective>  /tasks  /resume <id>  /cancel <id>  /report <id>
 safety    /perms  /allow read|write <folder>  /revoke read|write <folder>  /audit [n]
 config    /config show | get <key> | set <key> <value>
-chips     /chip [status] | active | load <chip> | unload <chip>      (also /chips)
+chips     /chip [status] | active | load <chip> | unload <chip>      (also /chips; chips: standard, advanced, light)
           /chippref [speed|balanced|quality]    how eagerly the advanced chip is used
 other     /save (memory update now)  /help  /exit
 """
@@ -255,11 +261,13 @@ def cmd_config(app, args):
             value = raw.lower() in ("true", "yes", "1")
         elif kind == "int":
             try:
+                lo, hi = choices
                 value = int(raw)
-                if not 512 <= value <= 131072:
+                if not lo <= value <= hi:
                     raise ValueError
             except ValueError:
-                print(f"invalid value '{raw}': expected a whole number between 512 and 131072. Nothing changed.")
+                print(f"invalid value '{raw}': expected a whole number between {choices[0]} and {choices[1]}. "
+                      "Nothing changed.")
                 return
         elif kind == "choice":
             if raw.lower() not in choices:
@@ -278,7 +286,7 @@ def cmd_config(app, args):
         print(f"{key} = {value if value != '' else '(disabled)'}")
 
         cm = getattr(app, "chips", None)
-        if cm is not None and attr in ("standard_chip", "advanced_chip"):
+        if cm is not None and attr in ("standard_chip", "advanced_chip", "light_chip"):
             app.llm.model = app.settings.standard_chip or app.llm.model
             cm._load_config()
             print("chip manager reloaded.")
@@ -286,6 +294,8 @@ def cmd_config(app, args):
             app.llm.num_ctx = app.settings.num_ctx
         if attr == "think":
             app.llm.think = app.settings.think
+        if attr == "light_chip" and value:
+            print(f"light chip: make sure it is installed:  ollama pull {value}   (/chip status shows it)")
         return
 
     print("Usage: /config show | get <key> | set <key> <value>")
@@ -400,6 +410,31 @@ def cmd_think(app, args) -> None:
     print(f"thinking is {'ON (smarter, slower)' if s.think else 'OFF (fast)'}; "
           f"showing thoughts: {'yes' if s.show_thinking else 'no'}  (/config set llm.show_thinking true|false)")
 
+
+def cmd_idle(app, args, convo) -> None:
+    w = app.idle
+    sub = args[0].lower() if args else "status"
+    if sub in ("on", "off"):
+        app.settings.idle_enabled = sub == "on"
+        _save_settings(app)
+    elif sub == "now":
+        if w.convo is None:
+            w.attach(convo)
+        done = w.run_once(force=True)
+        print(f"idle job: {done[0]}: {done[1]}" if done else "nothing to do right now.")
+        return
+    elif sub != "status":
+        print("Usage: /idle [status|on|off|now]")
+        return
+    st = w.status()
+    print(f"idle work: {'ON' if st['enabled'] else 'OFF'}  starts after {st['idle_after_s']} s of quiet"
+          f"  (idle now: {'yes' if st['idle_now'] else 'no'}{', running: ' + st['busy'] if st['busy'] else ''})")
+    print(f"light chip: {st['light']}   chat exchanges waiting for memory: {st['pending']}")
+    if not app.settings.light_chip:
+        print("tip: /config set chips.light qwen3:1.7b  lets Ksar save memory in the background (needs: ollama pull)")
+    for stamp, job, msg in st["log"]:
+        print(f"  {stamp} {job}: {msg}")
+
 # ----------------------------------------------------------------- chips
 def cmd_chips(app, args):
     cm = _chip_manager(app)
@@ -467,6 +502,8 @@ def handle_command(raw: str, app, convo, on_event) -> bool:
         cmd_chippref(app, args)
     elif cmd == "think":
         cmd_think(app, args)
+    elif cmd == "idle":
+        cmd_idle(app, args, convo)
     elif cmd == "tools":
         cmd_tools(app)
     elif cmd == "tool":
@@ -515,29 +552,39 @@ def run(app):
     if recovered:
         print(f"{len(recovered)} interrupted task(s) recovered as paused. /tasks to see them.")
     print(f"{app.names.name} ready, {app.names.user}. /help for commands, /exit to quit.")
+    app.idle.attach(convo)
+    if app.settings.idle_enabled:
+        app.idle.start()                 # warms the model and tidies memory while you are quiet
 
     while True:
+        for note in app.idle.pop_notes():
+            print(f"  (idle) {note}")
         try:
             line = input(f"\n{app.names.user}> ").strip()
         except (KeyboardInterrupt, EOFError):
             print()
             break
-        if not line:
-            continue
+        app.idle.user_active()           # background work stops now
         try:
-            if line.startswith("/"):
-                if not handle_command(line, app, convo, on_event):
-                    break
-            else:
-                live = Live(app.names.name, app.settings.show_thinking)
-                live.begin()
-                reply = convo.send(line, on_event, live)
-                live.finish(reply)
+            if not line:
+                continue
+            with app.lock:               # background jobs wait while a command runs
+                if line.startswith("/"):
+                    if not handle_command(line, app, convo, on_event):
+                        break
+                else:
+                    live = Live(app.names.name, app.settings.show_thinking)
+                    live.begin()
+                    reply = convo.send(line, on_event, live)
+                    live.finish(reply)
         except KeyboardInterrupt:
             print("\n(interrupted)")
         except Exception as e:
             print(f"error: {type(e).__name__}: {e}")
+        finally:
+            app.idle.user_idle()         # the quiet period starts now
 
+    app.idle.stop()
     try:
         convo.flush(on_event)
     except Exception as e:
