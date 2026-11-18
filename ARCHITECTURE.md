@@ -1,92 +1,54 @@
-# Ksar 0.2.1 - architecture
+# Ksar 0.3.2 - architecture
 
-Ksar is built from independent modules. The model (LLM) never touches the computer: it asks the
-**Tool Manager**, and the application enforces permissions, not the prompt.
+Local-first assistant. Python 3.10+, standard library only. The model runs in Ollama on the same computer.
+Full specification: see `docs/` (per-version notes) and the 0.3.1 specification text; this file is the short map.
 
+## Layers
 ```
-            you (console now; Telegram / desktop UI later = just another front-end)
-                                   |
- Conversation / Agent  --JSON-->  LLM (Ollama, replaceable: anything with .chat())
-        |   \
-        |    +--> Task Manager   persistent state machine, checkpoints, resume, no repeated steps
-        v
-   Tool Manager  -> validate -> risk -> permissions -> owner approval -> run -> verify -> audit.jsonl
-        |
-   +----+--------------------+
-   fs.* tools            memory.* tools            (docs.*, system.* come in later phases)
-                              |
-                      Memory (Markdown notes)  <--  Keeper (LLM proposes, app validates & stores)
-```
-
-## Memory
-
-One note = one `.md` file in `ksar_data/memory/notes/` (Obsidian-compatible, hand-editable):
-
-```
----
-id: lab-3   title: Lab 3   type: project   summary: ...   parent: school
----
-## Facts
-- Deadline: 2026-11-20 <!--f:a1b2c3 c:stated d:2026-11-13 s:chat:2026-11-13#4-->
-## Links      - [[lab-3-template]] (derived_from) - ...
-## Files      - C:\path\lab3.pdf | sha256:ab12... | 2026-11-13
-## History    - ~~Deadline: 2026-11-18~~ (superseded 2026-11-14) <!--...-->
+console (cli.py)  --Enter-->  Conversation.send  -->  Agent.turn
+                                  |                      |
+                                  |        router.route_message(text)   (no model call)
+                                  |           -> Route: tools offered, memory yes/no, complexity, pre-calculated sums
+                                  |        ChipManager.choose(...)      (manual /use override > automatic)
+                                  |           -> ChipChoice: chip, mode, reason, note, error
+                                  |        LLM.stream_chat / chat       (Ollama /api/chat, streamed)
+                                  |        ToolManager.call             (validate -> risk -> permissions -> approval ->
+                                  |                                      run -> verify -> audit.jsonl)
+                                  v
+                       journal + memory (Keeper) + routing.jsonl
+IdleWorker (thread): warm model, save memory on the light chip, split notes, daily check. Stops when you press Enter.
 ```
 
-| Requirement from the brief | How it is done |
+## Modules
+| module | job |
 |---|---|
-| Episodic / semantic / project / relational | note `type`s (`episodic`, `semantic`, `project`, `person`, `document`, `task`, `index`, `core`); typed `[[links]]`; `parent` gives the branching tree rooted at `core` |
-| Preserve sources | every fact has `s:` = the exact journal turn (`chat:DATE#N` -> `memory/journal/DATE.md`) or `task:ID`; files are recorded with a SHA-256 fingerprint |
-| Verified vs assumed | `c:` = `verified` / `stated` / `inferred`. The model can never write `verified`; facts learned after reading untrusted content are forced to `inferred` |
-| No duplicates / contradictions | normalised + similarity dedupe; `Key: value` facts with the same key **supersede** the old one, which moves to `## History`; a `verified` fact is never overwritten by a weaker one (goes to the `review` note instead) |
-| Never silently overwrite | old facts live in History; a snapshot of the whole note is saved before every change (`.history/<note>/`); `/restore` brings back any version |
-| Correction & deletion | `memory.correct`, `memory.forget` (approval), `/forget-note` (soft delete to `.trash`), `/purge` (permanent, explicit) |
-| Deterministic retrieval | BM25 over weighted fields (title, id, summary, file names, facts) + graph expansion over links/parent/children + fact-level selection. No model, no randomness: same memory + same query = same result (`/recall <q>` shows scores) |
-| Integrity | atomic writes, `doctor` finds broken links, orphans, bad parents, duplicates, missing ids, changed/missing files; `/doctor fix` repairs what is safe |
-| LLM decides, app stores | the Keeper asks the model for small JSON operations (add / correct / link / episode); ids, sizes, provenance, injection filter and conflict rules are applied by code |
-| Branches that don't pile up | a note over 25 facts is split: the model only *groups* fact numbers, the app moves the exact lines (nothing is rewritten or lost) |
+| `app.py` | `Ksar`: wires settings, memory, tools, chips, agent, idle worker; `app.lock` (RLock) |
+| `cli.py` | console loop, commands, live printer (thoughts grey, answer streamed, footer line) |
+| `router.py` | complexity score, tool/memory routing, calculator offer, pre-calculation |
+| `agent.py` | prompts, tool loop (bounded), `Conversation` (history window, journal, memory saves), `TurnInfo`, tasks |
+| `chips.py` | three slots (standard=Basic, advanced=Advanced, light=Idle/Light), RAM-aware loading, `/use` override |
+| `llm.py` | Ollama client: streaming, thinking split, JSON extraction, load/unload/ps/tags |
+| `resources.py` | free RAM (ctypes / `/proc`), model size estimates |
+| `idle.py` | background worker and its jobs |
+| `tasks.py` | persistent task state machine |
+| `memory/` | Markdown notes, journal, BM25+graph retrieval, Keeper (model proposes, code applies), maintenance |
+| `tools/` | `base.py` (Tool, Risk, permissions, audit), `fs.py`, `memory_tools.py`, `calc.py` |
 
-## Tools and permissions
+## Rules that hold everywhere
+- The model proposes; the application decides. Permissions are enforced by code, not by the prompt.
+- Plain chat is fast: ~100-token stable system prompt, streamed, no JSON. Tools and memory only when the message needs them.
+- The router and the calculator never call a model. One chip per turn; a manual `/use` choice lasts one message and
+  never bypasses the RAM check; the Idle/Light chip never answers chat.
+- Calculator: whitelist AST evaluator, bounded, pure computation (Risk.READ, no approval, does not taint the session).
+- Background work never holds the lock during a model call; memory is touched only under `app.lock`.
+- Everything is reversible or logged: note history, trash, `audit.jsonl`, `idle.log`, `routing.jsonl`.
 
-Permissions are in `ksar_data/config/permissions.json`. Only the owner edits them (`/allow`, `/revoke`);
-no tool can. Default: read + write only inside `ksar_data/workspace/`.
+## Data (`ksar_data/`, override with `KSAR_HOME`)
+`config/` (settings.json, permissions.json, profile.json), `memory/` (notes, journal, .history, .trash), `tasks/`,
+`workspace/` (the only default write area), `logs/` (audit.jsonl, idle.log, routing.jsonl).
 
-| Risk | Examples | Policy |
-|---|---|---|
-| read | fs.list, fs.search, fs.read_text, memory.search | allowed inside readable folders |
-| write | fs.write_text (new file), fs.copy, fs.move, fs.make_dir, memory.remember | allowed inside writable folders, never overwrites |
-| destructive | overwrite, fs.trash, memory.forget | owner approves every time; with no approver (background) the task parks in `waiting_approval` |
-| exec | (no tool yet) | reserved; will always need approval |
-
-Always blocked, even inside an allowed folder: Ksar's own source, `config/`, `logs/`, `memory/`, `.ssh`,
-`AppData`, `.env`, keys, password stores. Paths are resolved first, so `..` and symlinks cannot escape.
-Every write is read back and checked, and the result lists **verified effects**. Every call is appended to
-`logs/audit.jsonl` (time, task, tool, risk, arguments, decision, result).
-
-## Tasks
-
-`ksar_data/tasks/<id>.json`, rewritten after every step. States: pending, planning, in_progress,
-waiting_approval, paused, failed, completed, cancelled (illegal transitions raise). After a crash the task
-comes back `paused` and `/resume` continues where it stopped; an action that already succeeded is skipped, not
-repeated. A task's "completed" report lists what the **tools confirmed**, not what the model claims.
-
-## Safety model (short)
-
-1. Model -> tools only; permissions enforced in code.  2. Owner-only permission changes.
-3. Approval for anything destructive.  4. File contents and tool output are labelled untrusted data.
-5. Reading untrusted content marks the session *tainted*: later memory is only `inferred`.
-6. Instruction-like text ("ignore your rules...") is refused for memory.  7. Everything reversible
-(versions, trash, history).  8. Everything logged.
-
-## Not built yet (by design, next phases)
-
-PDF/Excel tools (Phase 2, will need `pypdf`/`openpyxl`), folder watchers, Telegram (Phase 4: just another
-front-end calling `Conversation.send` / `TaskManager`, with an approver that asks you in Telegram), desktop app
-(Phase 5), model escalation, GUI automation. Tool calling relies on the model emitting JSON; Qwen3 8B is
-decent but not perfect, so every layer validates and recovers instead of trusting it.
-
-## Add a tool
-
-Write `def handler(ctx, args) -> ToolResult` (check paths with `ctx.perms`, return `effects` you verified),
-wrap it in `Tool(name, description, params, Risk.X, handler)` and add it to a `tools()` list in
-`ksar/tools/`. It is then audited, validated and permission-gated like every other tool.
+## Where to extend
+- New tool: `Tool(name, description, params, Risk, handler)` in `tools/`, add to `registry.py`; add a family prefix to
+  `router.FAMILIES` only if it should answer to `@family`.
+- Routing: signals live in `router.assess`; the chip decision in `ChipManager._auto`; per-step chip in
+  `Agent._chip_for_step` (future mid-task escalation).

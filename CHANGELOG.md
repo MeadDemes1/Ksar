@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.2 ("3.2") - computation, manual chip choice, task-solving foundation
+Full description: `docs/v3.2.md`.
+- `/use basic|advanced|auto|status`: pick the chip for the next message only; validated against installed models and RAM.
+- `calc.evaluate`: deterministic, whitelist-AST calculator (exact integers/fractions, bounded, no eval/exec, no approval).
+- New `ksar/router.py`: structural complexity score (not just keywords/length), calculator routing, pre-calculation of
+  arithmetic in the message, bounded cost (about 2 ms, hostile input capped).
+- `ChipChoice` / `TurnInfo`: structured routing result with a reason; `/why`, footer line, `logs/routing.jsonl`.
+- Numeric work method in the instructions (calculated / estimated / tested are never mixed up).
+- Fix: idle worker skipped its first Ollama check when the machine had been up less than 60 s (0.3.1).
+- Regex hardening: several routing patterns were quadratic on pathological input (28 s for 20k newlines); fixed.
+- 40 new tests (107 in total).
+
 ## 0.3.1 ("3.1") - third chip slot and idle moments
 Full description: `docs/v3.1.md`.
 - New **light** chip slot (`/config set chips.light qwen3:1.7b`), used only in idle moments.

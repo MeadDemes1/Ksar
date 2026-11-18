@@ -1,4 +1,4 @@
-# Ksar 0.3.1
+# Ksar 0.3.2
 
 Local assistant with persistent branching memory, controlled tools, resumable tasks, and **dynamic multi-model orchestration**. Python 3.10+, no pip packages.
 
@@ -68,3 +68,10 @@ chips     /chip [status] | active | load <chip> | unload <chip>
 ## Idle moments (3.1)
 A third, small "light" chip works while you are quiet: warms the main model, saves memory, tidies notes.
 `ollama pull qwen3:1.7b`, then `/config set chips.light qwen3:1.7b`. `/idle` shows what it did. Details: `docs/v3.1.md`.
+
+## Numbers, chip choice and diagnostics (3.2)
+- **Calculator:** `calc.evaluate` is an exact, safe calculator. Arithmetic in your message is calculated for you; for
+  word problems Ksar is offered the calculator and told to use it. `/calc.evaluate 2^10 ; sqrt(144)` runs it directly.
+- **Choose the chip for one message:** `/use basic`, `/use advanced`, `/use auto`, `/use status`.
+- **Why did it answer like that?** `/why`, or read the footer line under each answer. Log: `ksar_data/logs/routing.jsonl`.
+- Details, limits and what is postponed: `docs/v3.2.md`.

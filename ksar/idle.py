@@ -45,7 +45,7 @@ class IdleWorker:
         self.last_active = clock()                                   # start-up counts as activity (for warm)
         self.last_idle_start = clock() - app.settings.idle_after_s   # ...but we are idle right away: warm early
         self._warmed_once = False
-        self._last_ps = 0.0
+        self._last_ps = None                                         # None = never asked Ollama yet
         self._doctor_day = ""
         self._skip_until: dict = {}
         self.notes: list = []                                        # shown before your next prompt
@@ -166,7 +166,7 @@ class IdleWorker:
             return None
         if time.time() - std.failed_at < 300 and std.failed_at:
             return None
-        if self.clock() - self._last_ps > 60:                        # what does Ollama really have loaded?
+        if self._last_ps is None or self.clock() - self._last_ps > 60:   # what does Ollama really have loaded?
             a.chips.refresh()
             self._last_ps = self.clock()
         if std.state != ChipState.UNLOADED:

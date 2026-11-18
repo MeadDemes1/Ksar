@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -22,81 +23,99 @@ from .tasks import Task
 from .tools.base import Risk, Session, ToolResult
 
 REMEMBER_RE = re.compile(r"remember|запомни|не забудь", re.I)
-COMPLEX_RE = re.compile(
-    r"\b(plan|planning|analy[sz]e|analysis|debug|architecture|refactor|design|compare|investigate|step[- ]by[- ]step"
-    r"|план\w*|анализ\w*|проанализ\w*|отлад\w*|архитектур\w*|сравни\w*)\b", re.I)
+# Routing lives in router.py (no model call). Re-exported here because tests and callers import it from agent.
+from .router import (FAMILIES, FS_RE, MEM_RE, MEMTOOL_RE, SYS_RE, Complexity, Route, assess,  # noqa: E402,F401
+                     classify_complexity, route_message)
 
 
-def classify_complexity(text: str) -> str:
-    """'complex' only from what the HUMAN asked (never from tool output or file contents)."""
-    text = text or ""
-    return "complex" if len(text) > 700 or COMPLEX_RE.search(text) else "normal"
-
-
-# ----------------------------------------------------------------------------- routing
-# Ksar answers as himself, straight from the model. Memory and tools are used ONLY when the message needs them,
-# because every extra prompt token and every extra model round-trip costs seconds on a CPU.
-MEM_RE = re.compile(
-    r"\b(remember|recall|remind\w*|memor(?:y|ies)|about me|did i|i told you|i said|last time|earlier|yesterday"
-    r"|previous(?:ly)?|what do you know)\b|запомни\w*|помн\w+|вспомни\w*|памят\w+|что ты знаешь|я говорил\w*"
-    r"|ранее|вчера|в прошлый раз", re.I)
-FS_RE = re.compile(
-    r"\b(files?|folders?|director(?:y|ies)|workspace|desktop|downloads?)\b|файл\w*|папк\w*|каталог\w*|рабоч\w+ стол"
-    r"|[\w.-]+\.(?:txt|md|py|json|csv|docx?|xlsx?|pdf|png|jpe?g|zip)\b|[A-Za-z]:\\|~/|\./", re.I)
-SYS_RE = re.compile(r"\b(what time|current time|time is it|disk space|free space|storage left|which os|operating system)\b"
-                    r"|сколько времени|который час|место на диске", re.I)
-MEMTOOL_RE = re.compile(r"\b(forget|search|check|look up|open|read|correct|link|attach)\b.{0,40}\b(memory|notes?\b(?!\.\w))"
-                        r"|\bforget (that|about)\b|забудь|найди в памяти|исправь в памяти", re.I)
-FAMILIES = {"fs": "fs.", "memory": "memory.", "sys": "sys."}
+class ChipUnavailable(Exception):
+    """A chip chosen with /use could not be used. The message is NOT answered by another chip."""
 
 
 @dataclass
-class Route:
-    tools: list = field(default_factory=list)      # tool names offered for this message (empty = plain chat)
-    memory: bool = False                           # inject relevant memory text into this message
+class TurnInfo:
+    """What happened in the last chat turn: which chip, why, which tools. Shown by /why, logged to routing.jsonl."""
+    chip: str = ""
+    model: str = ""
+    mode: str = "auto"
+    reason: str = ""
+    note: str = ""
+    error: str = ""
+    complexity: str = "normal"
+    score: int = 0
+    signals: str = ""
+    tools_offered: list = field(default_factory=list)
+    calc_reason: str = ""
+    preeval: int = 0
+    memory: bool = False
+    think: bool = False
+    steps: list = field(default_factory=list)          # chip used at every model step (room for mid-turn escalation)
+    tool_calls: list = field(default_factory=list)     # [{"tool", "ok", "message"}]
+    seconds: float = 0.0
 
-    def label(self) -> str:
+    def calc_summary(self) -> str:
+        calls = [t for t in self.tool_calls if t["tool"] == "calc.evaluate"]
         bits = []
-        if self.memory:
-            bits.append("memory")
-        if self.tools:
-            bits.append("tools: " + ", ".join(self.tools))
-        return "; ".join(bits)
+        if self.preeval:
+            bits.append(f"{self.preeval} pre-calculated")
+        if calls:
+            ok = sum(1 for t in calls if t["ok"])
+            bits.append(f"{ok}/{len(calls)} calls ok")
+        return ", ".join(bits)
+
+    def footer(self, stats: dict = None) -> str:
+        """One short line after the answer."""
+        from .chips import display_name
+        parts = [f"{display_name(self.chip)} {self.model}" if self.chip else "", self.mode]
+        n, ns = (stats or {}).get("eval_count"), (stats or {}).get("eval_duration")
+        if n and ns:
+            parts.append(f"{n} tokens, {n / (ns / 1e9):.1f} tok/s")
+        calc = self.calc_summary()
+        if calc:
+            parts.append("calc: " + calc)
+        bad = [t for t in self.tool_calls if not t["ok"] and t["tool"] != "calc.evaluate"]
+        if bad:
+            parts.append(f"{len(bad)} tool call(s) failed")
+        return "  (" + " · ".join(p for p in parts if p) + ")"
+
+    def lines(self) -> list:
+        from .chips import display_name
+        out = [f"chip:       {display_name(self.chip)} ({self.model}), {self.mode}" if self.chip else
+               f"chip:       none ({self.error})",
+               f"why:        {self.reason or '-'}"]
+        if self.note:
+            out.append(f"note:       {self.note}")
+        out.append(f"complexity: {self.complexity} (score {self.score}; {self.signals or 'no special signals'})")
+        out.append(f"offered:    {', '.join(self.tools_offered) or 'no tools'}"
+                   + (f"  [{self.calc_reason}]" if self.calc_reason else "") + ("; memory lookup" if self.memory else ""))
+        if self.preeval:
+            out.append(f"calculator: {self.preeval} expression(s) in your message were calculated before the model ran")
+        for t in self.tool_calls:
+            out.append(f"tool:       {t['tool']} -> {'ok' if t['ok'] else 'FAILED'}: {t['message'][:90]}")
+        out.append(f"steps:      {len(self.steps)} model step(s); thinking {'on' if self.think else 'off'}; {self.seconds:.1f}s")
+        return out
+
+    def to_log(self) -> dict:
+        d = {k: getattr(self, k) for k in ("chip", "model", "mode", "reason", "note", "error", "complexity", "score",
+                                           "signals", "tools_offered", "calc_reason", "preeval", "memory", "think",
+                                           "steps", "tool_calls")}
+        d["seconds"] = round(self.seconds, 2)
+        d["ts"] = datetime.now().isoformat(timespec="seconds")
+        return d
 
 
-def route_message(text: str, tool_names: list) -> Route:
-    """Cheap, instant routing (no model call). A tool is offered when the user names it (fs.read_text, @fs) or asks
-    for something only it can do; otherwise Ksar just talks."""
-    text = text or ""
-    low = text.lower()
-    names: list = []
-
-    def add(n):
-        if n in tool_names and n not in names:
-            names.append(n)
-
-    for n in tool_names:                                       # 1. explicit: the tool's own name
-        if re.search(r"(?<![\w.])" + re.escape(n) + r"(?![\w])", low):
-            add(n)
-    for fam, prefix in FAMILIES.items():                       # 2. explicit family: @fs, @memory, @sys
-        if re.search(r"(?<!\w)@" + fam + r"\b", low):
-            for n in tool_names:
-                if n.startswith(prefix):
-                    add(n)
-    if FS_RE.search(text):                                     # 3. natural requests
-        for n in tool_names:
-            if n.startswith("fs."):
-                add(n)
-    if SYS_RE.search(text):
-        add("sys.info")
-    if MEMTOOL_RE.search(text):
-        for n in tool_names:
-            if n.startswith("memory."):
-                add(n)
-    if "fs.write_text" in names:
-        add("fs.read_text")                                    # editing needs a read first
-    return Route(tools=names, memory=bool(MEM_RE.search(text)))
-
+CALC_RULES = [
+    "NUMBERS: never do non-trivial arithmetic in your head. Work in this order: restate the task; list the given values "
+    "and conditions; write each calculation as an expression; call calc.evaluate (several expressions at once, "
+    "separated by ;); read the returned values; check them for consistency (sign, size, units, a second way when "
+    "cheap); then answer.",
+    "Be honest about where a number comes from: 'calculated' = returned by calc.evaluate; 'estimated' = your own mental "
+    "arithmetic; 'tested' = code that was really run. You cannot run code, so never say you ran or tested anything. "
+    "Never invent calculator output. If a result looks wrong, say so and recompute. Lines starting with [Calculator "
+    "results ...] in the user's message were computed exactly by calc.evaluate.",
+    "For programming problems: use calc.evaluate to check sample outputs and intermediate values, and say which parts "
+    "you verified and which you did not.",
+]
 
 PROTOCOL = """HOW TO ANSWER: reply with exactly ONE JSON object and nothing else.
   {"say": "your answer to the user"}        -> final answer
@@ -120,6 +139,8 @@ def render_result(name: str, res: ToolResult) -> str:
     return head + "\nContinue: call another tool or give the final JSON."
 
 class Agent:
+    last_turn: "TurnInfo" = None
+
     def __init__(self, app):
         self.app = app
 
@@ -149,6 +170,8 @@ class Agent:
                          "Never guess the content of an existing file.")
         if any(n.startswith("memory.") for n in names):
             rules.append("Conversations are saved automatically. Use memory.remember only when asked to remember something.")
+        if "calc.evaluate" in names:
+            rules += CALC_RULES
         return self.persona() + "\n\n" + "\n".join(rules) + "\n\nTOOLS:\n" + a.tools.catalog(names)
 
     def system_prompt(self, query: str, task: bool = False) -> str:
@@ -217,27 +240,46 @@ class Agent:
 
     def turn(self, user_text: str, history: list, on_event: Callable = print, on_token: Callable = None) -> str:
         a = self.app
+        t0 = time.monotonic()
         think = bool(a.settings.think)
         route = self.route(user_text)
+        cx = route.complexity
+        choice = a.chips.choose(cx.level, cx.why() if cx.score else "")     # uses up a pending /use override
+        info = TurnInfo(chip=choice.name, model=choice.chip.model_id if choice.chip else "", mode=choice.mode,
+                        reason=choice.reason, note=choice.note, error=choice.error, complexity=cx.level,
+                        score=cx.score, signals=cx.why() if cx.score else "", tools_offered=list(route.tools),
+                        calc_reason=route.calc_reason, preeval=len(route.preeval), memory=route.memory, think=think)
+        self.last_turn = info
+        if choice.error:
+            self._log_turn(info)
+            raise ChipUnavailable(f"I did not answer: {choice.error}. Your /use choice is used up; "
+                                  "send the message again (or use /use basic).")
+        chip = choice.chip
+
         content = user_text
         if route.memory:                                         # local search (no model call), only when relevant
             prev = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
             found = a.index.context(user_text + " " + prev, budget=a.settings.recall_chars, include_core=False)
             content += ("\n\n[Your memory about this, use it only if relevant:\n" + found + "]") if found else \
                        "\n\n[Your memory has nothing about this. Do not make anything up.]"
+        if route.preeval:                                        # exact results, computed before the model runs
+            content += "\n\n[Calculator results (exact, computed by calc.evaluate):\n" + \
+                       "\n".join(f"{e} = {r}" for e, r in route.preeval) + "]"
         if route.label():
             on_event(f"  ({route.label()})")
         system = self.tool_prompt(route.tools) if route.tools else self.chat_prompt()
         msgs = [{"role": "system", "content": system}] + history[-a.settings.recent_messages:] + \
                [{"role": "user", "content": content}]
 
-        chip = a.chips.get_chip_for_task(classify_complexity(user_text))   # once per turn: no model ping-pong
         try:
             if not route.tools:                                   # plain chat: stream straight from the model
+                info.steps.append(chip.name)
                 reply = self._generate(msgs, chip, on_token, json_mode=False, think=think, extract_say=False)
                 return reply.strip() or "(no answer)"
             reply = "(no answer)"
             for _ in range(a.settings.max_agent_steps):
+                chip = self._chip_for_step(choice, info)          # hook: mid-turn escalation can plug in here later
+                info.steps.append(chip.name)
                 obj = self._step(msgs, chip, on_token, think)
                 if "tool" in obj:
                     name, args = str(obj["tool"]), obj.get("args") or {}
@@ -247,6 +289,7 @@ class Agent:
                                                 f"(available: {', '.join(route.tools)})")
                     else:
                         res = a.tools.call(name, args)
+                    info.tool_calls.append({"tool": name, "ok": bool(res.ok), "message": res.message})
                     on_event(f"  [tool] {'ok' if res.ok else 'FAILED'}: {res.message[:110]}")
                     msgs += [{"role": "assistant", "content": json.dumps(obj, ensure_ascii=False)},
                              {"role": "user", "content": render_result(name, res)}]
@@ -255,10 +298,25 @@ class Agent:
                 break
             else:
                 msgs.append({"role": "user", "content": 'Tool limit reached. Give the user your answer now: {"say": "..."}'})
+                info.steps.append(chip.name)
                 reply = str(self._step(msgs, chip, on_token, think).get("say") or "I ran out of steps before finishing.").strip()
             return reply
         finally:
+            info.seconds = time.monotonic() - t0
             a.chips.release_chip(chip)
+            self._log_turn(info)
+
+    def _chip_for_step(self, choice, info):
+        """Which chip answers the next model step. Today always the chip chosen for the turn; a later version can
+        return Advanced here when verification fails (the loop already records the chip of every step)."""
+        return choice.chip
+
+    def _log_turn(self, info: TurnInfo) -> None:
+        try:
+            with open(self.app.paths.logs / "routing.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(info.to_log(), ensure_ascii=False) + "\n")
+        except OSError:
+            pass
 
     # ------------------------------------------------------------ tasks
     def run_task(self, task: Task, on_event: Callable = print, max_steps: int = 30) -> Task:
@@ -366,7 +424,10 @@ class Conversation:
     def send(self, text: str, on_event: Callable = print, on_token: Callable = None) -> str:
         a = self.app
         with a.lock:
-            reply = a.agent.turn(text, self.window(), on_event, on_token)
+            try:
+                reply = a.agent.turn(text, self.window(), on_event, on_token)
+            except ChipUnavailable as e:                 # nothing is recorded: the message was not answered
+                return str(e)
             self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
             src = a.memory.journal_append(a.names.user, a.names.name, text, reply)
             a.session.src = src

@@ -38,6 +38,32 @@ class Chip:
     last_error: str = ""
 
 
+# User-facing names (internal identifiers stay: standard / advanced / light)
+DISPLAY = {"standard": "Basic", "advanced": "Advanced", "light": "Idle/Light"}
+ALIASES = {"basic": "standard", "standard": "standard", "advanced": "advanced", "auto": "auto",
+           "light": "light", "idle": "light"}
+
+
+def display_name(chip_name: str) -> str:
+    return DISPLAY.get(chip_name, chip_name)
+
+
+@dataclass
+class ChipChoice:
+    """Which foreground chip answers one message, and why. Small and structured so routing can grow later."""
+    chip: Optional["Chip"]                 # None when a manual choice could not be honoured
+    mode: str = "auto"                     # "auto" | "manual"
+    reason: str = ""                       # why this chip
+    requested: str = ""                    # internal name the user asked for ("" = automatic)
+    note: str = ""                         # e.g. why Advanced was wanted but Basic is used (auto mode only)
+    error: str = ""                        # manual choice failed: the message is NOT answered by another chip
+    complexity: str = "normal"
+
+    @property
+    def name(self) -> str:
+        return self.chip.name if self.chip else (self.requested or "?")
+
+
 # retention -> Ollama keep_alive for (standard, advanced, light)
 KEEP_ALIVE = {
     "persistent": (-1, -1, "30m"),
@@ -53,6 +79,8 @@ class ChipManager:
         self.resources = resources
         self.chips: dict = {}
         self.active_chip: Optional[Chip] = None
+        self.override: Optional[str] = None          # "standard" | "advanced": applies to the NEXT message only
+        self.last_choice: Optional[ChipChoice] = None
         self._load_config()
 
     # ------------------------------------------------------------------ setup
@@ -111,25 +139,108 @@ class ChipManager:
             return True
         return complexity == "complex"
 
-    def get_chip_for_task(self, task_complexity: str = "normal") -> Chip:
+    def _auto(self, complexity: str, signals: str = "") -> ChipChoice:
         std = self.chips.get("standard")
         if not std:
             raise RuntimeError("No standard chip configured (/config set chips.standard <model>)")
-        if self._advanced_allowed(task_complexity):
-            adv = self.chips["advanced"]
-            if adv.state == ChipState.UNLOADED and time.time() - adv.failed_at > RETRY_AFTER_FAILURE_S:
-                self.refresh()
-                if adv.state == ChipState.UNLOADED:
-                    ok, why = self.resources.explain(adv.estimated_ram_mb)
-                    if ok:
-                        self._load_chip(adv)
-                    else:
-                        adv.last_error = why
-            if adv.state != ChipState.UNLOADED:
-                self.active_chip = adv
-                return adv
-        self.active_chip = std
-        return std
+        s = self.app.settings
+        why = signals or ("complex request" if complexity == "complex" else "ordinary request")
+        priority = getattr(s, "performance_priority", "balanced")
+        basic = lambda reason, note="": ChipChoice(std, "auto", reason, "", note, "", complexity)
+        if complexity != "complex" and priority != "quality":
+            return basic(f"{why} -> Basic")
+        if "advanced" not in self.chips:
+            return basic(f"{why} -> Basic", "complex request, but no Advanced chip is configured"
+                         if complexity == "complex" else "")
+        if not getattr(s, "auto_escalation", True):
+            return basic(f"{why} -> Basic", "automatic escalation is off (chips.auto_escalation)")
+        if priority == "speed":
+            return basic(f"{why} -> Basic", "performance priority is 'speed'")
+        adv = self.chips["advanced"]
+        if adv.state == ChipState.UNLOADED and time.time() - adv.failed_at > RETRY_AFTER_FAILURE_S:
+            self.refresh()
+            if adv.state == ChipState.UNLOADED:
+                ok, reason = self.resources.explain(adv.estimated_ram_mb)
+                if ok:
+                    self._load_chip(adv)
+                else:
+                    adv.last_error = reason
+        if adv.state != ChipState.UNLOADED:
+            return ChipChoice(adv, "auto", f"{why} -> Advanced" if complexity == "complex"
+                              else f"priority 'quality' -> Advanced", "", "", "", complexity)
+        return basic(f"{why} -> Basic", f"Advanced not available: {adv.last_error or 'could not be loaded'}")
+
+    def get_chip_for_task(self, task_complexity: str = "normal") -> Chip:
+        """Automatic choice (used by background tasks and kept for compatibility)."""
+        choice = self._auto(task_complexity)
+        self.active_chip = choice.chip
+        return choice.chip
+
+    # ------------------------------------------------------------------ manual choice (/use)
+    def set_override(self, word: str):
+        """Validates a /use request NOW, so a broken override is never created. Returns (ok, message)."""
+        name = ALIASES.get((word or "").strip().lower())
+        if name is None:
+            return False, "unknown chip. Use: /use basic | advanced | auto | status"
+        if name == "auto":
+            self.override = None
+            return True, "automatic routing (no override)"
+        if name == "light":
+            return False, "the Idle/Light chip is reserved for background work and cannot answer chat"
+        err = self._manual_problem(name)
+        if err:
+            return False, err
+        self.override = name
+        return True, f"the next message will be answered by {display_name(name)} ({self.chips[name].model_id})"
+
+    def _manual_problem(self, name: str, loading: bool = False) -> str:
+        """'' when the chip can be used right now; otherwise the reason. Never bypasses the RAM check."""
+        chip = self.chips.get(name)
+        if chip is None:
+            return ("no Advanced chip is configured: /config set chips.advanced <model>" if name == "advanced"
+                    else "no Basic chip is configured: /config set chips.standard <model>")
+        if name == "standard":
+            return ""
+        try:
+            installed = self._llm_call("installed_models")
+        except Exception:
+            installed = None
+        if installed is not None and chip.model_id not in installed:
+            return f"{display_name(name)} model '{chip.model_id}' is not installed. Run: ollama pull {chip.model_id}"
+        if chip.state == ChipState.UNLOADED:
+            self.refresh()
+        if chip.state == ChipState.UNLOADED:
+            ok, why = self.resources.explain(chip.estimated_ram_mb)
+            if not ok:
+                return f"{display_name(name)} cannot be loaded safely: {why}"
+        return ""
+
+    def choose(self, complexity: str = "normal", signals: str = "", consume: bool = True) -> ChipChoice:
+        """The chip for ONE user message. A pending override wins over complexity and performance_priority, is used
+        up by this call, and is re-checked (RAM, installed) at this moment. If it cannot be honoured the choice
+        carries an error: the message is not silently answered by a different chip."""
+        name, self.override = (self.override, None) if consume else (self.override, self.override)
+        if name is None:
+            choice = self._auto(complexity, signals)
+        else:
+            err = self._manual_problem(name)
+            chip = self.chips.get(name)
+            if not err and chip.state == ChipState.UNLOADED:
+                if not self._load_chip(chip, quiet=True):
+                    err = f"{display_name(name)} failed to load: {chip.last_error}"
+            if err:
+                choice = ChipChoice(None, "manual", f"you asked for {display_name(name)}", name, "", err, complexity)
+            else:
+                choice = ChipChoice(chip, "manual", f"you asked for {display_name(name)}", name, "", "", complexity)
+        self.last_choice = choice
+        if choice.chip:
+            self.active_chip = choice.chip
+        return choice
+
+    def override_status(self) -> str:
+        if self.override:
+            return f"manual: the next message goes to {display_name(self.override)} ({self.chips[self.override].model_id}), then back to auto"
+        return "auto: complexity and performance_priority choose the chip"
 
     # ------------------------------------------------------------------ light slot (idle moments)
     def light_for_idle(self):

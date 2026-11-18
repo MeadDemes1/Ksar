@@ -35,6 +35,8 @@ CONFIG_KEYS = {
 HELP = """
 chat      just type; risky actions ask you [y/N]. Ksar only uses memory/tools when your message needs them.
 idle      /idle [status|on|off|now]    background work while you are quiet (see /config set chips.light)
+use       /use basic|advanced|auto|status   pick the chip for your NEXT message only (then back to auto)
+why       /why                              which chip answered the last message, why, and which tools ran
 think     /think [on|off]       let Ksar reason first (smarter, slower); thoughts show live in grey
 tools     /tools                 list tools    /<tool> [args]   run one yourself, e.g. /fs.list  /fs.read_text notes.txt
           name a tool (fs.read_text) or write @fs / @memory in a message to give Ksar that tool
@@ -347,13 +349,16 @@ class Live:
         elif kind == "stats":
             self.stats = text
 
-    def finish(self, reply: str) -> None:
+    def finish(self, reply: str, info=None) -> None:
         if self.in_think:
             print(self._dim(False), end="")
         if not self.chars:                              # nothing was streamed (e.g. a tool answer): print it now
             if not self.started:
                 self.begin()
             print(reply, end="")
+        if info is not None and getattr(info, "chip", ""):
+            print(f"\n{self._dim(True)}{info.footer(self.stats)}{self._dim(False)}")
+            return
         n, ns = self.stats.get("eval_count"), self.stats.get("eval_duration")
         if n and ns:
             print(f"\n{self._dim(True)}  ({n} tokens, {n / (ns / 1e9):.1f} tok/s){self._dim(False)}")
@@ -435,6 +440,34 @@ def cmd_idle(app, args, convo) -> None:
     for stamp, job, msg in st["log"]:
         print(f"  {stamp} {job}: {msg}")
 
+
+def cmd_use(app, args) -> None:
+    """/use basic | advanced | auto | status: choose the foreground chip for the NEXT message only."""
+    cm = _chip_manager(app)
+    if cm is None:
+        return
+    word = args[0].lower() if args else "status"
+    if word == "status":
+        print(cm.override_status())
+        info = getattr(app.agent, "last_turn", None)
+        if info and info.chip:
+            from .chips import display_name
+            print(f"last message: {display_name(info.chip)} ({info.mode}): {info.reason}")
+        return
+    ok, msg = cm.set_override(word)
+    print(("OK: " if ok else "cannot do that: ") + msg)
+    if not ok and cm.override:
+        print("(unchanged) " + cm.override_status())
+
+
+def cmd_why(app) -> None:
+    info = getattr(app.agent, "last_turn", None)
+    if info is None:
+        print("nothing to explain yet: send a message first.")
+        return
+    for line in info.lines():
+        print("  " + line)
+
 # ----------------------------------------------------------------- chips
 def cmd_chips(app, args):
     cm = _chip_manager(app)
@@ -455,11 +488,16 @@ def cmd_chips(app, args):
             ram = f"{r.ram_free_mb} MB free / {r.ram_total_mb} MB total" if r.ram_known else "unknown (cannot read RAM)"
             print(f"RAM: {ram}   priority: {app.settings.performance_priority}   "
                   f"retention: {app.settings.chips_retention}   escalation: {app.settings.auto_escalation}")
+        print("routing:  " + cm.override_status())
         if "advanced" not in cm.chips:
             print("advanced chip: off. Enable: /config set chips.advanced <model>")
     elif sub == "active":
         active = cm.active_chip
         print(f"active chip: {active.name} ({active.model_id})" if active else "no chip is active.")
+        last = getattr(cm, "last_choice", None)
+        if last:
+            print(f"last choice: {last.mode}: {last.reason}" + (f"  [{last.note}]" if last.note else ""))
+        print(cm.override_status())
     elif sub in ("load", "unload"):
         if not rest or rest[0] not in cm.chips:
             print(f"Usage: /chip {sub} <chip>   available: {', '.join(cm.chips) or 'none'}")
@@ -500,6 +538,10 @@ def handle_command(raw: str, app, convo, on_event) -> bool:
         cmd_chips(app, args)
     elif cmd == "chippref":
         cmd_chippref(app, args)
+    elif cmd == "use":
+        cmd_use(app, args)
+    elif cmd == "why":
+        cmd_why(app)
     elif cmd == "think":
         cmd_think(app, args)
     elif cmd == "idle":
