@@ -29,9 +29,10 @@ import hashlib
 import os
 import re
 import shutil
+import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -65,8 +66,30 @@ def safe_id(name) -> str:
     return n
 
 
+TAG_RE = re.compile(r"(?<![\w#])#([^\W\d][\w\-]*)", re.U)
+
+
+def fact_tags(text: str) -> set:
+    """Obsidian-style #tags written in a fact, e.g. '#rule' (lower-case, without '#')."""
+    return {t.lower() for t in TAG_RE.findall(str(text))}
+
+
+def strip_tags(text: str) -> str:
+    return re.sub(r"\s+", " ", TAG_RE.sub(" ", str(text))).strip()
+
+
 def norm(text: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", str(text).lower(), flags=re.U)).strip()
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", strip_tags(text).lower(), flags=re.U)).strip()
+
+
+def safe_folder(folder) -> str:
+    """Relative folder inside notes/ ('' = root): at most 3 levels, no dots/drive letters/illegal characters."""
+    parts = []
+    for seg in re.split(r"[\\/]+", str(folder or "")):
+        seg = re.sub(r'[<>:"|?*\x00-\x1f]', "", seg).strip().strip(".")
+        if seg and seg not in (".", "..") and not seg.startswith("."):
+            parts.append(seg[:40])
+    return "/".join(parts[:3])
 
 
 def jaccard(a: str, b: str) -> float:
@@ -154,6 +177,9 @@ class Note:
     files: list = field(default_factory=list)    # (path, sha256, date)
     extra: dict = field(default_factory=dict)    # unknown sections, preserved verbatim
     id_mismatch: bool = False
+    rev: str = ""                                # file revision (mtime+size) this object was read from; not saved
+    intro: list = field(default_factory=list)    # free text the owner wrote under the title, preserved verbatim
+    props: dict = field(default_factory=dict)    # front-matter keys Ksar does not use (aliases, tags, ...): raw lines, preserved
 
 
 @dataclass
@@ -191,20 +217,54 @@ def parse_fact(line: str, history: bool = False) -> Optional[Fact]:
 LINK_RE = re.compile(r"^[-*]\s*\[\[([^\]]+)\]\](?:\s*\(([^)]*)\))?(?:\s*[-:\u2014]\s*(.*))?$")
 
 
-def split_frontmatter(text: str):
+_FM_KEY = re.compile(r"^([A-Za-z_][\w\- ]*):(.*)$")
+
+
+def _unquote(v: str) -> str:
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        return v[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    if len(v) >= 2 and v[0] == v[-1] == "'":
+        return v[1:-1].replace("''", "'")
+    return v
+
+
+def yaml_scalar(v) -> str:
+    """A front-matter value that is valid YAML (and so valid for Obsidian Properties): values containing ': ', ' #',
+    leading indicators, or that look like numbers/booleans are double-quoted."""
+    v = one_line(v)
+    if not v:
+        return ""
+    risky = (re.search(r":(\s|$)| #", v) or re.match(r"^[\[\]{}&*!|>'\"%@`#?,-]", v) or re.fullmatch(r"[\d.]+", v)
+             or v.lower() in ("null", "true", "false", "yes", "no", "~", "on", "off"))
+    return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"' if risky else v
+
+
+def split_frontmatter_ex(text: str):
+    """(meta, raw property blocks, body). meta = known single-line values (unquoted). raw = every key's original lines,
+    including the indented '- item' lines Obsidian writes for lists (tags, aliases), so nothing the owner added is lost."""
     m = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", text, re.S) if text.startswith("---") else None
     if not m:
-        return {}, text
-    meta = {}
+        return {}, {}, text
+    meta, raw, cur = {}, {}, None
     for line in m.group(1).splitlines():
-        k, _, v = line.partition(":")
-        if k.strip():
-            meta[k.strip().lower()] = v.strip()
-    return meta, m.group(2)
+        km = _FM_KEY.match(line) if line and not line[0].isspace() else None
+        if km:
+            cur = km.group(1).strip().lower()
+            meta[cur] = _unquote(km.group(2))
+            raw[cur] = [line]
+        elif cur is not None:
+            raw[cur].append(line)
+    return meta, raw, m.group(2)
+
+
+def split_frontmatter(text: str):
+    meta, _, body = split_frontmatter_ex(text)
+    return meta, body
 
 
 def parse_note(text: str, fallback_id: str) -> Note:
-    meta, body = split_frontmatter(text)
+    meta, raw_props, body = split_frontmatter_ex(text)
     legacy = not meta
     n = Note(id=safe_id(meta.get("id")) or fallback_id, title=meta.get("title", ""),
              type=meta.get("type", "semantic"), summary=meta.get("summary", ""),
@@ -212,6 +272,9 @@ def parse_note(text: str, fallback_id: str) -> Note:
              created=meta.get("created", ""), updated=meta.get("updated", ""))
     if n.type not in NOTE_TYPES:
         n.type = "semantic"
+    if not legacy:
+        n.props = {k: v for k, v in raw_props.items() if k not in ("id", "title", "type", "summary", "parent", "status",
+                                                                   "created", "updated")}
     sections: dict = {}
     key = "_intro"
     for line in body.splitlines():
@@ -225,6 +288,13 @@ def parse_note(text: str, fallback_id: str) -> Note:
             sections.setdefault(key, [])
             continue
         sections.setdefault(key, []).append(line)
+    if not legacy:
+        intro = sections.pop("_intro", [])
+        while intro and not intro[0].strip():
+            intro.pop(0)
+        while intro and not intro[-1].strip():
+            intro.pop()
+        n.intro = intro
     if legacy:                                   # old flat notes: bullets become 'inferred' facts
         for line in sections.get("_intro", []):
             m = re.match(r"^summary:\s*(.+)$", line, re.I)
@@ -245,6 +315,8 @@ def parse_note(text: str, fallback_id: str) -> Note:
                 f = parse_fact(line)
                 if f:
                     n.facts.append(f)
+                elif line.strip():                      # free text the owner typed under Facts: keep it, do not drop it
+                    sections.setdefault("Notes", []).append(line)
             elif name == "history":
                 f = parse_fact(line, history=True)
                 if f:
@@ -265,10 +337,15 @@ def parse_note(text: str, fallback_id: str) -> Note:
 
 
 def render_note(n: Note) -> str:
-    out = ["---", f"id: {n.id}", f"title: {one_line(n.title)}", f"type: {n.type}",
-           f"summary: {one_line(n.summary)}", f"parent: {n.parent}", f"status: {n.status}",
-           f"created: {n.created}", f"updated: {n.updated}", "---", f"# {one_line(n.title)}", "",
-           "## Facts"]
+    out = ["---", f"id: {n.id}", f"title: {yaml_scalar(n.title)}", f"type: {n.type}",
+           f"summary: {yaml_scalar(n.summary)}", f"parent: {n.parent}", f"status: {n.status}",
+           f"created: {n.created}", f"updated: {n.updated}"]
+    for block in n.props.values():
+        out += list(block)
+    out += ["---", f"# {one_line(n.title)}", ""]
+    if n.intro:
+        out += list(n.intro) + [""]
+    out += ["## Facts"]
     out += [f.line() for f in n.facts]
     if n.links:
         out += ["", "## Links"]
@@ -297,38 +374,141 @@ class MemoryStore:
         for d in (self.notes_dir, self.hist, self.trash, self.journal_dir):
             d.mkdir(parents=True, exist_ok=True)
         self._cache: dict = {}
+        # Thread safety: ONE small re-entrant lock around single store operations (file write + snapshot, a few ms).
+        # Nothing slow (model calls, searches over many notes) ever runs while it is held.
+        self._lock = threading.RLock()
+        self._paths: dict = {}              # note id -> file path (notes may live in sub-folders)
+        self.gen = 0                        # bumped on every change; lets the search index update incrementally
+        self._changes: list = []            # (gen, note id), bounded; see changed_since()
+        self._floor = 0
+        self._core_cache = None
+        self.core_builds = 0                # how often the core digest was really rebuilt (tests / /memory status)
+        self.scan()
 
-    # ---- basic access
+    # ---- change tracking, registry and revisions
+    def _touch(self, nid: str) -> None:
+        self.gen += 1
+        self._changes.append((self.gen, nid))
+        if len(self._changes) > 4096:
+            drop = self._changes[:2048]
+            self._changes = self._changes[2048:]
+            self._floor = drop[-1][0]
+        if nid == "core":
+            self._core_cache = None
+
+    def changed_since(self, gen: int):
+        """Ids changed after generation `gen`, or None when the log no longer reaches back that far (rebuild)."""
+        if gen < self._floor:
+            return None
+        return {nid for g, nid in self._changes if g > gen}
+
+    def scan(self) -> bool:
+        """Rebuild the id -> file registry from disk and notice edits made outside Ksar (Obsidian, an editor).
+        Never called on the chat path; the idle worker and commands call it. True when something changed."""
+        with self._lock:
+            found: dict = {}
+            for dirpath, dirnames, filenames in os.walk(self.notes_dir):
+                dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+                for fn in sorted(filenames):
+                    if fn.endswith(".md"):
+                        nid = fn[:-3]
+                        if safe_id(nid) == nid and nid not in found:
+                            found[nid] = Path(dirpath) / fn
+            changed = set(self._paths) ^ set(found)
+            for nid, p in found.items():
+                if self._paths.get(nid) not in (None, p):
+                    changed.add(nid)
+                hit = self._cache.get(nid)
+                if hit is not None:
+                    try:
+                        if hit[0] != p.stat().st_mtime_ns:
+                            changed.add(nid)
+                    except OSError:
+                        changed.add(nid)
+            self._paths = found
+            for nid in changed:
+                self._cache.pop(nid, None)
+                self._touch(nid)
+            return bool(changed)
+
+    def known_ids(self) -> list:
+        """Ids from the in-memory registry: no disk access (use ids() for a fresh scan). list() of a dict is atomic in
+        CPython, so another thread adding a note cannot break this iteration."""
+        return sorted(list(self._paths))
+
+    def has(self, nid: str) -> bool:
+        return nid in self._paths
+
     def path(self, nid: str) -> Path:
-        return self.notes_dir / f"{nid}.md"
+        return self._paths.get(nid) or self.notes_dir / f"{nid}.md"
 
     def exists(self, nid: str) -> bool:
         nid = safe_id(nid)
         return bool(nid) and self.path(nid).is_file()
 
     def ids(self) -> list:
-        return sorted(p.stem for p in self.notes_dir.glob("*.md") if safe_id(p.stem) == p.stem)
+        self.scan()
+        return sorted(self._paths)
 
     def signature(self) -> tuple:
-        return tuple((p.stem, p.stat().st_mtime_ns) for p in sorted(self.notes_dir.glob("*.md")))
+        return tuple((nid, p.stat().st_mtime_ns) for nid, p in sorted(self._paths.items()) if p.exists())
+
+    def folder_of(self, nid: str) -> str:
+        p = self._paths.get(nid)
+        if not p:
+            return ""
+        try:
+            rel = p.parent.relative_to(self.notes_dir)
+        except ValueError:
+            return ""
+        return "" if str(rel) == "." else rel.as_posix()
 
     def get(self, nid: str, copy_: bool = True) -> Optional[Note]:
         nid = safe_id(nid)
         p = self.path(nid)
         if not nid or not p.is_file():
             return None
-        mt = p.stat().st_mtime_ns
+        with self._lock:
+            st = p.stat()
+            mt = st.st_mtime_ns
+            hit = self._cache.get(nid)
+            if not hit or hit[0] != mt:
+                note = parse_note(p.read_text(encoding="utf-8", errors="replace"), nid)
+                if note.id != nid:
+                    note.id, note.id_mismatch = nid, True
+                note.rev = f"{mt}-{st.st_size}"
+                hit = (mt, note)
+                self._paths.setdefault(nid, p)
+                self._cache[nid] = hit
+            return copy.deepcopy(hit[1]) if copy_ else hit[1]
+
+    def peek(self, nid: str) -> Optional[Note]:
+        """Cached note WITHOUT touching the disk when it is already in memory (chat path). Do not modify the result."""
         hit = self._cache.get(nid)
-        if not hit or hit[0] != mt:
-            note = parse_note(p.read_text(encoding="utf-8", errors="replace"), nid)
-            if note.id != nid:
-                note.id, note.id_mismatch = nid, True
-            hit = (mt, note)
-            self._cache[nid] = hit
-        return copy.deepcopy(hit[1]) if copy_ else hit[1]
+        return hit[1] if hit else self.get(nid, copy_=False)
+
+    def rev(self, nid: str) -> str:
+        """Current revision of a note's file ('' if missing). Used to detect that a note changed while a
+        background job was thinking."""
+        try:
+            st = self.path(safe_id(nid)).stat()
+        except OSError:
+            return ""
+        return f"{st.st_mtime_ns}-{st.st_size}"
+
+    def revs(self, ids) -> dict:
+        return {i: self.rev(i) for i in ids}
+
+    def stale(self, expected: dict) -> list:
+        """Ids whose file changed since `expected` (a revs() snapshot)."""
+        return [i for i, r in expected.items() if self.rev(i) != r]
 
     def all_notes(self, copy_: bool = False) -> list:
         return [n for n in (self.get(i, copy_) for i in self.ids()) if n]
+
+    def cached_notes(self) -> list:
+        """All notes from memory (no disk scan); the registry is kept fresh by scan()/writes."""
+        return [n for n in (self.peek(i) for i in self.known_ids()) if n]
 
     def children(self, nid: str) -> list:
         return [n.id for n in self.all_notes() if n.parent == nid]
@@ -353,11 +533,17 @@ class MemoryStore:
         note.updated = now_iso()
         if not note.created:
             note.created = note.updated
-        self._snapshot(note.id)
-        p = self.path(note.id)
-        atomic_write(p, render_note(note))
-        self._cache[note.id] = (p.stat().st_mtime_ns, copy.deepcopy(note))
-        self._log(f"{reason}: {note.id}")
+        with self._lock:
+            self._snapshot(note.id)
+            p = self.path(note.id)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write(p, render_note(note))
+            st = p.stat()
+            note.rev = f"{st.st_mtime_ns}-{st.st_size}"
+            self._paths[note.id] = p
+            self._cache[note.id] = (st.st_mtime_ns, copy.deepcopy(note))
+            self._touch(note.id)
+            self._log(f"{reason}: {note.id}")
 
     def versions(self, nid: str) -> list:
         d = self.hist / safe_id(nid)
@@ -369,14 +555,17 @@ class MemoryStore:
         if not src.is_file():
             return False
         self._snapshot(nid)
-        atomic_write(self.path(nid), src.read_text(encoding="utf-8"))
-        self._cache.pop(nid, None)
-        self._log(f"restored {nid} from {src.name}")
+        with self._lock:
+            atomic_write(self.path(nid), src.read_text(encoding="utf-8"))
+            self._cache.pop(nid, None)
+            self._paths[nid] = self.path(nid)
+            self._touch(nid)
+            self._log(f"restored {nid} from {src.name}")
         return True
 
     # ---- notes
     def create(self, nid: str, title: str = "", type_: str = "semantic", summary: str = "",
-               parent: str = "core") -> Note:
+               parent: str = "core", folder: str = "") -> Note:
         nid = safe_id(nid)
         if not nid:
             raise ValueError("bad note id")
@@ -393,6 +582,9 @@ class MemoryStore:
         title = one_line(title) or nid.replace("-", " ").title()
         note = Note(id=nid, title=title, type=type_, summary=one_line(summary)[:160] or title,
                     parent=parent, created=now_iso())
+        folder = safe_folder(folder)
+        if folder:                                   # a physical sub-folder (e.g. User/Rules); the id never changes
+            self._paths[nid] = self.notes_dir / folder / f"{nid}.md"
         self.save(note, "create")
         if parent:
             self.link(parent, nid, "branch", note.summary)
@@ -404,8 +596,11 @@ class MemoryStore:
         note = self.get(nid)
         if not note or nid == "core":
             return False
-        shutil.move(str(self.path(nid)), str(self.trash / f"{nid}.{datetime.now():%Y%m%d-%H%M%S}.md"))
-        self._cache.pop(nid, None)
+        with self._lock:
+            shutil.move(str(self.path(nid)), str(self.trash / f"{nid}.{datetime.now():%Y%m%d-%H%M%S}.md"))
+            self._cache.pop(nid, None)
+            self._paths.pop(nid, None)
+            self._touch(nid)
         for other in self.all_notes(copy_=True):
             changed = False
             keep = [l for l in other.links if l[0] != nid]
@@ -569,6 +764,113 @@ class MemoryStore:
             fh.write(f"\n### turn {n} - {datetime.now():%H:%M}\n**{user_name}:** {user}\n\n**{assistant_name}:** {reply}\n")
         return f"chat:{day}#{n}"
 
+    # ---- organisation (folders), graph views, core digest, journal reading
+    def set_summary(self, nid: str, summary: str, reason: str = "summary") -> bool:
+        note = self.get(nid)
+        summary = one_line(summary)[:240]
+        if not note or note.summary == summary:
+            return False
+        note.summary = summary
+        self.save(note, reason)
+        return True
+
+    def move_note(self, nid: str, folder: str) -> bool:
+        """Moves a note's file to another folder. The id (= file name) does not change, so every [[wikilink]],
+        parent, source reference and the note's history stay valid: Obsidian resolves links by file name."""
+        nid = safe_id(nid)
+        folder = safe_folder(folder)
+        src = self.path(nid)
+        if not nid or nid == "core" or not src.is_file():
+            return False
+        dest = self.notes_dir / folder / f"{nid}.md" if folder else self.notes_dir / f"{nid}.md"
+        if dest == src or dest.exists():
+            return False
+        with self._lock:
+            self._snapshot(nid)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(src, dest)
+            self._paths[nid] = dest
+            self._cache.pop(nid, None)
+            self._touch(nid)
+            self._log(f"moved {nid} -> {folder or '(root)'}")
+        return True
+
+    def backlinks(self, nid: str) -> list:
+        """[(note id, relation)]: notes that link to `nid` or have it as parent."""
+        nid = safe_id(nid)
+        out = []
+        for n in self.cached_notes():
+            if n.id == nid:
+                continue
+            rels = [r for t, r, _ in n.links if t == nid]
+            if rels:
+                out.append((n.id, rels[0]))
+            elif n.parent == nid:
+                out.append((n.id, "child"))
+        return sorted(out)
+
+    def core_digest(self, max_chars: int = 900) -> str:
+        """Compact text of the core note, built once and kept in RAM; rebuilt only after the core note changes."""
+        c = self._core_cache
+        if c and c[0] == max_chars:
+            return c[1]
+        note = self.peek("core")
+        if not note:
+            return ""
+        lines = [f"[core] {note.summary}"]
+        for f in note.facts:
+            lines.append(f"- {strip_tags(f.text)}" + (" (unverified)" if f.conf == "inferred" else ""))
+        branches = [t for t, r, _ in note.links if r == "branch"]
+        if branches:
+            lines.append("branches: " + ", ".join(branches))
+        text = "\n".join(lines)
+        if len(text) > max_chars:
+            text = text[:max_chars].rsplit("\n", 1)[0]
+        self._core_cache = (max_chars, text)
+        self.core_builds += 1
+        return text
+
+    _TURN_RE = re.compile(r"\n### turn (\d+) - (\d{2}:\d{2})\n\*\*(.+?):\*\* (.*?)\n\n\*\*(.+?):\*\* (.*?)(?=\n### turn |\Z)", re.S)
+
+    def read_journal(self, day: str) -> list:
+        f = self.journal_dir / f"{day}.md"
+        if not f.is_file():
+            return []
+        text = "\n" + f.read_text(encoding="utf-8", errors="replace")
+        return [{"src": f"chat:{day}#{m.group(1)}", "day": day, "n": int(m.group(1)), "time": m.group(2),
+                 "user": m.group(4).strip(), "assistant": m.group(6).strip()}
+                for m in self._TURN_RE.finditer(text)]
+
+    def journal_turns(self, srcs) -> list:
+        """The journal turns named by source ids like 'chat:2026-11-19#4' (the journal is the original record)."""
+        want, days = {}, set()
+        for s_ in srcs:
+            m = re.match(r"^chat:(\d{4}-\d{2}-\d{2})#(\d+)", str(s_))
+            if m:
+                want.setdefault(m.group(1), set()).add(int(m.group(2)))
+        out = []
+        for day in sorted(want):
+            out += [t for t in self.read_journal(day) if t["n"] in want[day]]
+        return out
+
+    def journal_since(self, since: datetime, until: Optional[datetime] = None) -> list:
+        """Turns written at or after `since` (naive local time, as the journal records it)."""
+        out, day = [], since.date()
+        last = (until or datetime.now()).date()
+        while day <= last:
+            for t in self.read_journal(day.isoformat()):
+                hh, mm = map(int, t["time"].split(":"))
+                stamp = datetime(day.year, day.month, day.day, hh, mm)
+                if stamp >= since.replace(second=0, microsecond=0) and (until is None or stamp <= until):
+                    out.append(t)
+            day += timedelta(days=1)
+        return out
+
+    def last_turn_src(self) -> str:
+        day = today()
+        turns = self.read_journal(day)
+        return turns[-1]["src"] if turns else ""
+
     # ---- views
     def tree_text(self) -> str:
         notes = {n.id: n for n in self.all_notes()}
@@ -580,7 +882,9 @@ class MemoryStore:
         def walk(nid, depth):
             seen.add(nid)
             n = notes[nid]
-            lines.append("  " * depth + f"- {nid} [{n.type}, {len(n.facts)} facts]" + (f" - {n.summary}" if n.summary else ""))
+            fol = self.folder_of(nid)
+            lines.append("  " * depth + f"- {nid} [{n.type}, {len(n.facts)} facts]" + (f" - {n.summary}" if n.summary else "")
+                         + (f"  ({fol}/)" if fol else ""))
             for c in sorted(kids.get(nid, [])):
                 if c not in seen:
                     walk(c, depth + 1)
@@ -609,7 +913,7 @@ class MemoryStore:
     def doctor(self, fix: bool = False) -> list:
         issues: list = []
         notes = {n.id: n for n in self.all_notes(copy_=True)}
-        for tmp in self.notes_dir.glob("*.tmp"):
+        for tmp in self.notes_dir.rglob("*.tmp"):
             issues.append(Issue("leftover-temp", tmp.name, "interrupted write", False))
             if fix:
                 tmp.unlink(missing_ok=True)
@@ -681,3 +985,16 @@ class MemoryStore:
                     self.save(fresh, "doctor-reattach")
                     self.link("core", nid, "branch", fresh.summary)
         return issues
+
+
+def _locked(fn):
+    def wrapper(self, *a, **kw):
+        with self._lock:
+            return fn(self, *a, **kw)
+    wrapper.__name__, wrapper.__doc__ = fn.__name__, fn.__doc__
+    return wrapper
+
+
+for _name in ("create", "delete_note", "purge", "add_fact", "correct_fact", "retract_fact", "flag_review", "link",
+              "attach_file", "journal_append", "doctor", "restore_version", "set_summary"):
+    setattr(MemoryStore, _name, _locked(getattr(MemoryStore, _name)))

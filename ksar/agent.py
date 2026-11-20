@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from .tools.base import Risk, Session, ToolResult
 
 REMEMBER_RE = re.compile(r"remember|запомни|не забудь", re.I)
 # Routing lives in router.py (no model call). Re-exported here because tests and callers import it from agent.
+from .memcmd import canned_reply, parse_memory_command
 from .router import (FAMILIES, FS_RE, MEM_RE, MEMTOOL_RE, SYS_RE, Complexity, Route, assess,  # noqa: E402,F401
                      classify_complexity, route_message)
 
@@ -49,6 +51,8 @@ class TurnInfo:
     preeval: int = 0
     memory: bool = False
     think: bool = False
+    memory_lines: list = field(default_factory=list)   # why memory was (or was not) used for this message
+    time_note: bool = False                            # a [Time: ...] note was added to this message
     steps: list = field(default_factory=list)          # chip used at every model step (room for mid-turn escalation)
     tool_calls: list = field(default_factory=list)     # [{"tool", "ok", "message"}]
     seconds: float = 0.0
@@ -92,13 +96,17 @@ class TurnInfo:
             out.append(f"calculator: {self.preeval} expression(s) in your message were calculated before the model ran")
         for t in self.tool_calls:
             out.append(f"tool:       {t['tool']} -> {'ok' if t['ok'] else 'FAILED'}: {t['message'][:90]}")
+        for l in self.memory_lines:
+            out.append("memory:     " + l)
+        if self.time_note:
+            out.append("time:       a time note was added to the message")
         out.append(f"steps:      {len(self.steps)} model step(s); thinking {'on' if self.think else 'off'}; {self.seconds:.1f}s")
         return out
 
     def to_log(self) -> dict:
         d = {k: getattr(self, k) for k in ("chip", "model", "mode", "reason", "note", "error", "complexity", "score",
                                            "signals", "tools_offered", "calc_reason", "preeval", "memory", "think",
-                                           "steps", "tool_calls")}
+                                           "memory_lines", "time_note", "steps", "tool_calls")}
         d["seconds"] = round(self.seconds, 2)
         d["ts"] = datetime.now().isoformat(timespec="seconds")
         return d
@@ -257,11 +265,38 @@ class Agent:
         chip = choice.chip
 
         content = user_text
-        if route.memory:                                         # local search (no model call), only when relevant
-            prev = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+        recall, injected = None, False
+        prev = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+        if route.memory or a.settings.memory_auto or route.tools:
+            try:                                                 # RAM-only, deterministic: no disk scan, no model call
+                recall = a.index.recall(user_text + (" " + prev if route.memory else ""), limit=4)
+            except Exception:
+                recall = None
+        if recall is not None:
+            personal = route.memory or (a.settings.memory_auto and recall.worthwhile and not (
+                recall.rules and not recall.blocks and not route.memory))
+            use = route.memory or (a.settings.memory_auto and recall.worthwhile) or bool(route.tools and recall.rules)
+            if use:
+                found = recall.text(budget=a.settings.recall_chars, include_core=personal)
+                if not found and route.memory:                  # asked explicitly: keep the old behaviour as a fallback
+                    found = a.index.context(user_text + " " + prev, budget=a.settings.recall_chars, include_core=False)
+                if found:
+                    content += "\n\n[Your memory about this, use it only if relevant:\n" + found + "]"
+                    injected = True
+                elif route.memory:
+                    content += "\n\n[Your memory has nothing about this. Do not make anything up.]"
+            info.memory_lines = recall.explain().splitlines()[:8] if (use or route.memory) else \
+                [f"not used: {recall.why}"]
+        elif route.memory:
             found = a.index.context(user_text + " " + prev, budget=a.settings.recall_chars, include_core=False)
             content += ("\n\n[Your memory about this, use it only if relevant:\n" + found + "]") if found else \
                        "\n\n[Your memory has nothing about this. Do not make anything up.]"
+            injected = bool(found)
+        info.memory = injected
+        tnote = a.time.context_for(user_text)                    # only when asked about time, or after a long absence
+        if tnote:
+            content += "\n\n" + tnote
+            info.time_note = True
         if route.preeval:                                        # exact results, computed before the model runs
             content += "\n\n[Calculator results (exact, computed by calc.evaluate):\n" + \
                        "\n".join(f"{e} = {r}" for e, r in route.preeval) + "]"
@@ -396,7 +431,9 @@ class Agent:
 
 
 class Conversation:
-    """One chat session: history, journal (raw record), and automatic memory consolidation."""
+    """One chat session: history, journal (raw record), and memory saving.
+    Memory saving is NEVER part of the chat when the background worker runs: the exchange goes to the job queue and
+    the answer returns at once. Without a running worker (library use, tests) it falls back to the old synchronous save."""
 
     def __init__(self, app):
         self.app = app
@@ -404,6 +441,11 @@ class Conversation:
         self.pending: list = []
         self.gen = 0                  # counts memory saves; lets background work notice that a save happened
         self._start = 0               # first history message that is still sent to the model
+        self.state = threading.RLock()  # protects history/pending/gen only; never held while a model runs
+
+    def _async(self) -> bool:
+        a = self.app
+        return bool(a.settings.memory_async and a.idle.running)
 
     def window(self) -> list:
         """The part of the history sent to the model. It shrinks in STEPS (to half) instead of by one message
@@ -423,33 +465,58 @@ class Conversation:
 
     def send(self, text: str, on_event: Callable = print, on_token: Callable = None) -> str:
         a = self.app
-        with a.lock:
-            try:
-                reply = a.agent.turn(text, self.window(), on_event, on_token)
-            except ChipUnavailable as e:                 # nothing is recorded: the message was not answered
-                return str(e)
-            self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
+        a.time.begin_message()
+        cmd = parse_memory_command(text, a.time.now(), a.time.session_start) if self._async() else None
+        if cmd:                                          # "remember what we discussed": answer now, work in background
+            reply = canned_reply(text)
             src = a.memory.journal_append(a.names.user, a.names.name, text, reply)
             a.session.src = src
-            self.pending.append((text, reply))
-            if REMEMBER_RE.search(text) or len(self.pending) >= a.settings.consolidate_every:
+            with self.state:
+                self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
+            a.jobs.add("extract", {"since": cmd["since"].isoformat(), "explicit": True, "label": cmd["label"]},
+                       priority=1, source_refs=[src])
+            a.agent.last_turn = TurnInfo(mode="memory", reason=f"memory command ({cmd['label']}) handed to the background worker")
+            a.time.note_response()
+            return reply
+        try:
+            reply = a.agent.turn(text, self.window(), on_event, on_token)
+        except ChipUnavailable as e:                     # nothing is recorded: the message was not answered
+            return str(e)
+        with self.state:
+            self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
+        src = a.memory.journal_append(a.names.user, a.names.name, text, reply)
+        a.session.src = src
+        a.time.note_response()
+        explicit = bool(REMEMBER_RE.search(text))
+        if self._async():
+            a.jobs.add("extract", {"srcs": [src], "explicit": explicit}, priority=1 if explicit else 6, source_refs=[src])
+        else:
+            with self.state:
+                self.pending.append((text, reply))
+                due = explicit or len(self.pending) >= a.settings.consolidate_every
+            if due:
                 self.flush(on_event)
         return reply
 
     def flush(self, on_event: Callable = print) -> bool:
+        """Synchronous memory save (fallback when no background worker runs, or /save wait)."""
         a = self.app
-        with a.lock:
-            if not self.pending:
-                return True
-            on_event("  (updating memory...)")
-            rep = a.keeper.consolidate(self.pending, a.session.src, tainted=a.session.tainted)
-            for line in rep.lines:
-                on_event(f"  memory: {line}")
+        with self.state:
+            pending = list(self.pending)
+        if not pending:
+            return True
+        on_event("  (updating memory...)")
+        rep = a.keeper.consolidate(pending, a.session.src, tainted=a.session.tainted)
+        for line in rep.lines:
+            on_event(f"  memory: {line}")
+        with self.state:
             self.pending = [] if rep.ok else self.pending[-12:]
             self.gen += 1
-            for n in a.memory.all_notes():
-                if len(n.facts) > a.settings.split_fact_threshold:
-                    made = split_note(a.memory, a.llm, n.id, a.settings.split_fact_threshold)
-                    if made:
-                        on_event(f"  memory: note '{n.id}' branched into {', '.join(made)}")
-            return rep.ok
+        if rep.ok:
+            a.mark_processed_through_now()
+        for n in a.memory.cached_notes():
+            if len(n.facts) > a.settings.split_fact_threshold:
+                made = split_note(a.memory, a.llm, n.id, a.settings.split_fact_threshold)
+                if made:
+                    on_event(f"  memory: note '{n.id}' branched into {', '.join(made)}")
+        return rep.ok

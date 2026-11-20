@@ -1,4 +1,4 @@
-# Ksar 0.3.2
+# Ksar 0.3.3
 
 Local assistant with persistent branching memory, controlled tools, resumable tasks, and **dynamic multi-model orchestration**. Python 3.10+, no pip packages.
 
@@ -75,3 +75,13 @@ A third, small "light" chip works while you are quiet: warms the main model, sav
 - **Choose the chip for one message:** `/use basic`, `/use advanced`, `/use auto`, `/use status`.
 - **Why did it answer like that?** `/why`, or read the footer line under each answer. Log: `ksar_data/logs/routing.jsonl`.
 - Details, limits and what is postponed: `docs/v3.2.md`.
+
+## Memory, retrieval and time (3.3)
+- **Memory is a connected notebook:** `core` -> branches (user, preferences, rules, goals, projects ...) -> focused notes, in folders,
+  as plain Markdown. Open `ksar_data/memory/` as an Obsidian vault.
+- **Ksar remembers in the background.** Chat never waits; `/save` queues, `/save wait` does it now; "remember the important things
+  we discussed during the last hour" is answered at once and processed by the worker. Look with `/memory status`, `/memory queue`.
+- **Ksar uses memory by itself** when a message clearly benefits from it (and always for your restrictions); `/why` and
+  `/memory search <query>` show why a note was used.
+- **Time:** `/time`; set `/config set time.zone Europe/Berlin` if you do not want the operating system's zone.
+- Details, limits and migration: `docs/v3.3.md`.

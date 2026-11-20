@@ -28,6 +28,13 @@ class Settings:
     idle_enabled: bool = True         # background work while you are not talking to Ksar
     idle_after_s: int = 20            # seconds of quiet before idle work starts
     warm_on_start: bool = True        # load the standard model in the background at start-up
+    idle_notify: bool = False         # print background results before your next prompt (default: only /idle status, logs)
+    memory_async: bool = True         # memory is saved by the background worker; chat never waits for it
+    memory_auto: bool = True          # look in memory automatically when a message clearly benefits from it
+    memory_chip: str = "auto"         # chip for background memory work: auto (light if set, else standard) | light | standard
+    memory_auto_organize: bool = False  # let the worker move old root-level notes into branch folders (gradual)
+    timezone: str = ""                # IANA name like Europe/Berlin; empty = the operating system's timezone
+    time_long_gap_hours: int = 4      # silence after which Ksar notices that you are back
     recall_chars: int = 2000          # memory text injected, only when a message needs memory
     consolidate_every: int = 8        # exchanges between memory updates (also on /exit and "remember")
     split_fact_threshold: int = 25    # a note with more facts gets branched

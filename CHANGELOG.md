@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.3 ("3.3") - connected memory, autonomous memory management, time awareness
+Full description: `docs/v3.3.md`.
+- Obsidian-style hierarchy on the existing Markdown notes: `core` -> branches (user, preferences, rules, goals, projects, ...)
+  -> focused notes, in folders, with relation types and inline `#rule`/`#preference`/... tags. Branches appear on demand.
+- Extraction pipeline prepare -> plan -> apply: evidence-based, concept-level grounding (paraphrases, numbers, negation),
+  yes/no checks for borderline facts, pending facts re-checked later, no placeholders, no empty notes, rules never downgraded,
+  contradictions sent to review, per-fact journal sources.
+- Proactive 3-level retrieval (core cache, branch, notes) with a relevance gate, rule priority, bounded link walk and
+  explanations (`/why`, `/memory search`); incremental in-RAM index (0.7 ms at 400 notes); no disk scan per message.
+- Independent worker: persistent job queue, chat never waits for memory, no app.lock in the worker, revision checks against stale
+  results, cancel-on-Enter, quiet by default. Journal catch-up after crashes.
+- Time service: timezone-aware, session/idle tracking, long-absence note (once), date rollover, persisted last-seen.
+- Commands: `/memory status|tree|search|backlinks|graph|check|queue|organize|save|time`, `/time`, `/save [wait]`.
+- Fixes: Ksar no longer drops what you add in Obsidian (extra front-matter keys incl. multi-line tags/aliases, intro text, free
+  text under Facts); `: ` in titles/summaries no longer produces invalid YAML; the old keeper's concrete prompt example and
+  empty-note creation (source of "favourite colour: unknown") are gone.
+- 87 new tests (194 in total).
+
 ## 0.3.2 ("3.2") - computation, manual chip choice, task-solving foundation
 Full description: `docs/v3.2.md`.
 - `/use basic|advanced|auto|status`: pick the chip for the next message only; validated against installed models and RAM.

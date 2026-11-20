@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -10,6 +12,8 @@ from typing import Callable, Optional
 from .agent import Agent, Conversation
 from .chips import ChipManager
 from .idle import IdleWorker
+from .memory.jobs import JobQueue
+from .timeinfo import TimeService
 from .config import Paths, default_home, load_settings, save_settings
 from .llm import OllamaLLM
 from .memory import Index, MemoryStore
@@ -44,12 +48,62 @@ class Ksar:
         self.resources = ResourceManager(self.paths.workspace)
         self.chips = ChipManager(self, self.resources)       # must exist before the Agent runs
         self.agent = Agent(self)
-        self.lock = threading.RLock()            # held while a command runs and while background jobs touch memory
+        # app.lock only serialises foreground entry points (console commands). The background worker never takes it and
+        # nothing slow (model calls, memory work) runs under it; memory has its own short store-level lock.
+        self.lock = threading.RLock()
+        self.time = TimeService(self.settings.timezone, self.paths.config / "session_state.json",
+                                long_gap_hours=self.settings.time_long_gap_hours)
+        self.jobs = JobQueue(self.paths.memory / ".jobs" / "queue.json")
         self.idle = IdleWorker(self)             # started by the console; see idle.py
         self.ensure_core()
+        self.catch_up()
 
     def save_settings(self) -> None:
         save_settings(self.paths, self.settings)
+
+    # -- journal watermark: which conversation turns have been through memory extraction
+    def _watermark(self) -> dict:
+        wm = self.jobs.get_meta("watermark")
+        return dict(wm) if isinstance(wm, dict) else None
+
+    def mark_processed(self, srcs) -> None:
+        wm = self._watermark() or {}
+        for src in srcs:
+            m = re.match(r"^chat:(\d{4}-\d{2}-\d{2})#(\d+)", str(src))
+            if m:
+                wm[m.group(1)] = max(int(m.group(2)), int(wm.get(m.group(1), 0)))
+        self.jobs.set_meta("watermark", wm)
+
+    def mark_processed_through_now(self) -> None:
+        """Everything in today's journal so far counts as handled (used after a synchronous memory save)."""
+        last = self.memory.last_turn_src()
+        if last:
+            self.mark_processed([last])
+
+    def unprocessed_turns(self, days: int = 3) -> list:
+        wm = self._watermark() or {}
+        out = []
+        for i in range(days - 1, -1, -1):
+            day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+            out += [t for t in self.memory.read_journal(day) if t["n"] > int(wm.get(day, 0))]
+        return out
+
+    def catch_up(self) -> None:
+        """First start of this version: older journal turns count as handled (they went through the old process).
+        Later starts: turns that never reached memory (crash, queue lost) are queued again."""
+        try:
+            if self._watermark() is None:
+                wm = {}
+                for i in range(3):
+                    day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+                    n = len(self.memory.read_journal(day))
+                    if n:
+                        wm[day] = n
+                self.jobs.set_meta("watermark", wm)
+            elif self.settings.memory_async and self.unprocessed_turns():
+                self.jobs.add("extract", {"after_watermark": True}, priority=7, dedupe_key="extract:catch-up")
+        except Exception:
+            pass
 
     # -- identity
     def _names_file(self) -> Path:
@@ -82,7 +136,7 @@ class Ksar:
         """Creates the root of the memory tree on first run (deterministic, no model needed)."""
         if self.memory.exists("core"):
             return
-        self.memory.create("core", "Core", "core", "Root of my memory. Everything branches from here.")
+        self.memory.create("core", "Core", "core", "Central note: who the owner is, stable preferences, rules and main projects, with links to the branches.")
         for text in (f"My name: {self.names.name}",
                      f"Owner: {self.names.user}",
                      "I am a local assistant: my memory is linked Markdown notes; every fact keeps its source and history",

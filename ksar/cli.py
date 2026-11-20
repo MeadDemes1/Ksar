@@ -26,6 +26,13 @@ CONFIG_KEYS = {
     "idle.enabled": ("idle_enabled", "bool", None),
     "idle.after": ("idle_after_s", "int", (3, 3600)),
     "idle.warm": ("warm_on_start", "bool", None),
+    "idle.notify": ("idle_notify", "bool", None),
+    "memory.async": ("memory_async", "bool", None),
+    "memory.auto": ("memory_auto", "bool", None),
+    "memory.chip": ("memory_chip", "choice", ("auto", "light", "standard")),
+    "memory.organize": ("memory_auto_organize", "bool", None),
+    "time.zone": ("timezone", "str", None),
+    "time.gap": ("time_long_gap_hours", "int", (1, 72)),
     "llm.history_chars": ("history_chars", "int", (1000, 100000)),
     "llm.think": ("think", "bool", None),
     "llm.show_thinking": ("show_thinking", "bool", None),
@@ -34,13 +41,15 @@ CONFIG_KEYS = {
 
 HELP = """
 chat      just type; risky actions ask you [y/N]. Ksar only uses memory/tools when your message needs them.
+memory    /memory status|tree|search|backlinks|graph|check|queue|organize|save|time   (old /tree /recall /open ... still work)
+          /save [wait]   /time
 idle      /idle [status|on|off|now]    background work while you are quiet (see /config set chips.light)
 use       /use basic|advanced|auto|status   pick the chip for your NEXT message only (then back to auto)
 why       /why                              which chip answered the last message, why, and which tools ran
 think     /think [on|off]       let Ksar reason first (smarter, slower); thoughts show live in grey
 tools     /tools                 list tools    /<tool> [args]   run one yourself, e.g. /fs.list  /fs.read_text notes.txt
           name a tool (fs.read_text) or write @fs / @memory in a message to give Ksar that tool
-memory    /tree  /recall <q>  /open <note>  /history <note>  /restore <note> <version>
+          /tree  /recall <q>  /open <note>  /history <note>  /restore <note> <version>
           /forget-note <note>  /purge <note>  /doctor [fix]  /reflect
 tasks     /task <objective>  /tasks  /resume <id>  /cancel <id>  /report <id>
 safety    /perms  /allow read|write <folder>  /revoke read|write <folder>  /audit [n]
@@ -78,11 +87,15 @@ def _chip_manager(app):
 # ----------------------------------------------------------------- memory
 def cmd_memory(app, args, convo, on_event):
     if not args:
-        print("memory: /tree /recall /open /history /restore /forget-note /purge /doctor /reflect")
+        print("memory: /memory status | tree | search <q> | open <note> | backlinks <note> | graph <note> | check [fix] | "
+              "queue | organize [apply] | sync | save [wait] | time")
+        print("also:   /tree /recall /open /history /restore /forget-note /purge /doctor /reflect /save /time")
         return
     sub, rest = args[0].lstrip("/"), args[1:]
     m = app.memory
 
+    if sub != "tree" and sub != "open" and cmd_memory_new(app, sub, rest, convo, on_event):
+        return
     if sub == "tree":
         print(m.tree_text())
     elif sub == "recall":
@@ -133,10 +146,130 @@ def cmd_memory(app, args, convo, on_event):
         for i in issues:
             print(f"[{i.kind}] {i.note}: {i.detail}" + (" (fixed)" if i.fixed else ""))
     elif sub == "reflect":
-        convo.flush(on_event)          # <- convo is now passed in
+        cmd_save(app, [], convo, on_event)          # <- convo is now passed in
     else:
         print(f"unknown memory command '{sub}'")
 
+
+
+def _jobs_table(app) -> None:
+    rows = app.jobs.listing(20)
+    if not rows:
+        print("queue is empty.")
+    for j in rows:
+        when = f" next try {j.next_try[11:19]}" if j.next_try else ""
+        print(f"  {j.id}  {j.type:<10} {j.status:<9} prio {j.priority}  attempts {j.attempts}/{j.max_attempts}{when}"
+              + (f"  {j.result}" if j.result else ""))
+
+
+def _memory_status(app) -> None:
+    m, ix = app.memory, app.index
+    notes = m.cached_notes()
+    branches = [n for n in notes if n.type == "index"]
+    folders = {m.folder_of(n.id) for n in notes if m.folder_of(n.id)}
+    core = m.core_digest(1500)
+    print(f"notes: {len(notes)}   branches: {len(branches)}   folders: {len(folders)}   vault: {app.paths.memory}")
+    print(f"core:  {len(core)} chars cached in RAM (rebuilt {m.core_builds}x)   index: generation {ix._gen}, "
+          f"{ix.full_rebuilds} full rebuild(s), {ix.incremental_updates} incremental update(s)")
+    q = app.jobs.counts()
+    print(f"queue: {', '.join(f'{v} {k}' for k, v in q.items()) or 'empty'}   "
+          f"background worker: {'running' if app.idle.running else 'not running'}   memory chip: {app.settings.memory_chip}")
+    print(f"last consolidation: {app.jobs.get_meta('last_extract_ok', 'never')}")
+    print(f"unprocessed conversation turns: {len(app.unprocessed_turns())}")
+
+
+def _graph_text(app, nid: str) -> None:
+    m = app.memory
+    n = m.get(nid)
+    if not n:
+        print(f"no note '{nid}'")
+        return
+    print(f"[{n.id}] {n.title} ({n.type}, {len(n.facts)} facts)  folder: {m.folder_of(n.id) or '(root)'}")
+    print(f"  parent:   {n.parent or '-'}")
+    kids = sorted(c.id for c in m.cached_notes() if c.parent == n.id)
+    print(f"  children: {', '.join(kids) or '-'}")
+    for t, r, b in n.links:
+        print(f"  out  {r:<16} -> [[{t}]]" + (f"  {b}" if b else ""))
+    for src, rel in m.backlinks(n.id):
+        print(f"  in   {rel:<16} <- [[{src}]]")
+
+
+def cmd_memory_new(app, sub: str, rest: list, convo, on_event) -> bool:
+    """The 0.3.3 /memory subcommands. Returns True when handled."""
+    from .memory.graph import organize_plan, validate_graph
+    m = app.memory
+    if sub == "status":
+        _memory_status(app)
+    elif sub == "search" or sub == "why":
+        q = " ".join(rest)
+        if not q:
+            print("Usage: /memory search <query>")
+            return True
+        rc = app.index.recall(q)
+        print(rc.explain())
+        txt = rc.text(app.settings.recall_chars, include_core=True)
+        print("\n" + (txt or "(nothing relevant)"))
+    elif sub == "backlinks":
+        if not rest:
+            print("Usage: /memory backlinks <note>")
+        else:
+            bl = m.backlinks(rest[0])
+            print("\n".join(f"  {rel:<10} <- [[{src}]]" for src, rel in bl) or "no notes link here.")
+    elif sub == "graph":
+        _graph_text(app, rest[0]) if rest else print("Usage: /memory graph <note>")
+    elif sub == "check":
+        m.scan()
+        issues = m.doctor(fix=bool(rest and rest[0] == "fix")) + validate_graph(m)
+        print("no issues found." if not issues else "")
+        for i in issues:
+            print(f"[{i.kind}] {i.note}: {i.detail}" + (" (fixed)" if i.fixed else ""))
+    elif sub == "queue":
+        _jobs_table(app)
+    elif sub == "organize":
+        plan = organize_plan(m, limit=50, min_age_s=0)
+        if not plan:
+            print("nothing to move: every note with a branch folder is already in it.")
+        elif rest and rest[0] == "apply":
+            for nid, folder in plan:
+                print(f"{'moved' if m.move_note(nid, folder) else 'skipped'}: {nid} -> {folder}/")
+        else:
+            for nid, folder in plan:
+                print(f"would move {nid} -> {folder}/")
+            print("run '/memory organize apply' to do it (ids and links stay valid; history is kept).")
+    elif sub == "sync":
+        print("changes from outside Ksar noticed." if m.scan() else "no outside changes.")
+    elif sub == "save":
+        cmd_save(app, rest, convo, on_event)
+    elif sub == "time":
+        print("\n".join(app.time.status_lines()))
+    else:
+        return False
+    return True
+
+
+def cmd_save(app, args, convo, on_event) -> None:
+    """/save: queue everything not yet processed (runs in the background); /save wait: do it now."""
+    if convo._async() and not (args and args[0] == "wait"):
+        app.jobs.add("extract", {"after_watermark": True, "explicit": True}, priority=1,
+                     dedupe_key="extract:save-now")
+        print("queued: Ksar will process it in the background (/memory queue shows progress).")
+        return
+    if convo._async():                                   # wait: run the extraction jobs here, then return
+        app.idle.attach(convo)
+        app.idle.abort.clear()
+        for _ in range(12):
+            if not app.jobs.has_ready(("extract",)):
+                break
+            done = app.idle.run_once(force=True)
+            print(f"  {done[0]}: {done[1]}" if done else "  (nothing ran)")
+            if not done:
+                break
+        return
+    convo.flush(on_event)
+
+
+def cmd_time(app) -> None:
+    print("\n".join(app.time.status_lines()))
 
 # ----------------------------------------------------------------- tasks
 def cmd_tasks(app, args, on_event):
@@ -434,7 +567,10 @@ def cmd_idle(app, args, convo) -> None:
     st = w.status()
     print(f"idle work: {'ON' if st['enabled'] else 'OFF'}  starts after {st['idle_after_s']} s of quiet"
           f"  (idle now: {'yes' if st['idle_now'] else 'no'}{', running: ' + st['busy'] if st['busy'] else ''})")
-    print(f"light chip: {st['light']}   chat exchanges waiting for memory: {st['pending']}")
+    print(f"light chip: {st['light']}   memory chip: {app.settings.memory_chip}   "
+          f"exchanges waiting (sync mode): {st['pending']}   queue: "
+          f"{', '.join(f'{v} {k}' for k, v in st['queue'].items()) or 'empty'}")
+    print(f"last memory consolidation: {st['last_extract'] or 'never'}")
     if not app.settings.light_chip:
         print("tip: /config set chips.light qwen3:1.7b  lets Ksar save memory in the background (needs: ollama pull)")
     for stamp, job, msg in st["log"]:
@@ -555,8 +691,12 @@ def handle_command(raw: str, app, convo, on_event) -> bool:
             cmd_tool(app, args[0], args[1:])
     elif cmd in app.tools.tools:              # /fs.list  /fs.read_text notes.txt
         cmd_tool(app, cmd, args)
+    elif cmd == "memory":
+        cmd_memory(app, args, convo, on_event)
+    elif cmd == "time":
+        cmd_time(app)
     elif cmd == "save":
-        convo.flush(on_event)
+        cmd_save(app, args, convo, on_event)
     elif cmd in GROUPS:                       # grouped form: /memory tree
         handler = GROUPS[cmd]
         if handler is cmd_memory:
@@ -599,8 +739,10 @@ def run(app):
         app.idle.start()                 # warms the model and tidies memory while you are quiet
 
     while True:
-        for note in app.idle.pop_notes():
-            print(f"  (idle) {note}")
+        notes = app.idle.pop_notes()
+        if app.settings.idle_notify:
+            for note in notes:
+                print(f"  (idle) {note}")
         try:
             line = input(f"\n{app.names.user}> ").strip()
         except (KeyboardInterrupt, EOFError):
